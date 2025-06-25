@@ -178,12 +178,16 @@ struct Decrypt {
     iv: Vec<u8>,
 }
 impl Decrypt {
-    pub fn new(key: Vec<u8>, encrypted_data: Vec<u8>) -> Self {
+    pub fn new(encrypted_data: Vec<u8>) -> Self {
         Decrypt {
-            key,
+            key: vec![],
             encrypted_data,
             iv: vec![],
         }
+    }
+
+    pub fn set_key(&mut self, key: Vec<u8>) {
+        self.key = key
     }
 
     fn set_iv(&mut self, iv: Vec<u8>) {
@@ -339,7 +343,7 @@ async fn main() -> Result<(), Error> {
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
 
     let depot_key = depot_key.to_owned().into_bytes();
-    let client = Arc::new(set_client()?);
+    let client = set_client()?;
 
     let steam_content_url_list = match cdn_url_list {
         Some(cdn_url_list) => cdn_url_list.to_owned(),
@@ -352,7 +356,9 @@ async fn main() -> Result<(), Error> {
         if file.flags == 0 {
             let file_name = if metadata.filenames_encrypted {
                 let decoded_file_name = BASE64_MIME.decode(file.filename.as_bytes())?;
-                Decrypt::new(depot_key.clone(), decoded_file_name).decrypt_file_name()?
+                let mut decrypt = Decrypt::new(decoded_file_name);
+                decrypt.set_key(depot_key.clone());
+                decrypt.decrypt_file_name()?
             } else {
                 file.filename
             };
@@ -376,7 +382,6 @@ async fn main() -> Result<(), Error> {
             pb.set_message(file_name);
 
             let client_for_closure = &client;
-            let depot_key_for_closure = &depot_key;
             let steam_content_url_list_for_closure = &steam_content_url_list;
             let path_for_closure = &path;
             let pb_for_closure = &pb;
@@ -392,15 +397,10 @@ async fn main() -> Result<(), Error> {
                         chunk_sha.clone(),
                     );
 
-                    let client_for_spawn = Arc::clone(&client_for_closure);
-                    let depot_key_for_spawn = depot_key_for_closure.clone();
-                    let steam_content_url_list_for_spawn =
-                        steam_content_url_list_for_closure.clone();
-
                     let data = chunk_info
                         .get_chunk(
-                            steam_content_url_list_for_spawn,
-                            &client_for_spawn,
+                            steam_content_url_list_for_closure.to_owned(),
+                            &client_for_closure,
                             retry_num,
                         )
                         .await;
@@ -410,11 +410,11 @@ async fn main() -> Result<(), Error> {
                     }
 
                     let decrypted_data = spawn_blocking(move || {
-                        let mut decrypt = Decrypt::new(depot_key_for_spawn.clone(), data);
+                        let mut decrypt = Decrypt::new(data);
                         let decrypted_data =
                             decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
 
-                        let decrypt_vz = Decrypt::new(depot_key_for_spawn, decrypted_data);
+                        let decrypt_vz = Decrypt::new(decrypted_data);
                         let vz_data = &decrypt_vz.decrypt_vz().expect("Failed to decrypt vz")
                             [..chunk_info.original_size as usize];
 
