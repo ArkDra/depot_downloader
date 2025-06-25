@@ -19,10 +19,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -342,7 +339,6 @@ async fn main() -> Result<(), Error> {
     let manifest = Manifest::new(manifest_path);
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
 
-    let depot_key = depot_key.to_owned().into_bytes();
     let client = set_client()?;
 
     let steam_content_url_list = match cdn_url_list {
@@ -355,9 +351,10 @@ async fn main() -> Result<(), Error> {
     for file in payload.mappings {
         if file.flags == 0 {
             let file_name = if metadata.filenames_encrypted {
+                let depot_key_clone = depot_key.to_owned().into_bytes();
                 let decoded_file_name = BASE64_MIME.decode(file.filename.as_bytes())?;
                 let mut decrypt = Decrypt::new(decoded_file_name);
-                decrypt.set_key(depot_key.clone());
+                decrypt.set_key(depot_key_clone);
                 decrypt.decrypt_file_name()?
             } else {
                 file.filename
@@ -381,6 +378,7 @@ async fn main() -> Result<(), Error> {
             .progress_chars("#>-"));
             pb.set_message(file_name);
 
+            let depot_key_for_closure = depot_key;
             let client_for_closure = &client;
             let steam_content_url_list_for_closure = &steam_content_url_list;
             let path_for_closure = &path;
@@ -388,13 +386,12 @@ async fn main() -> Result<(), Error> {
 
             stream::iter(file.chunks)
                 .map(|chunk| async move {
-                    let chunk_sha = HEXLOWER.encode(&chunk.sha);
                     let chunk_info = ChunkInfo::new(
                         chunk.offset,
                         chunk.cb_original,
                         metadata.depot_id,
                         path_for_closure.to_owned(),
-                        chunk_sha.clone(),
+                        HEXLOWER.encode(&chunk.sha),
                     );
 
                     let data = chunk_info
@@ -409,8 +406,11 @@ async fn main() -> Result<(), Error> {
                         return;
                     }
 
+                    let depot_key_for_spawn = depot_key_for_closure.to_owned();
+
                     let decrypted_data = spawn_blocking(move || {
                         let mut decrypt = Decrypt::new(data);
+                        decrypt.set_key(depot_key_for_spawn.into_bytes());
                         let decrypted_data =
                             decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
 
@@ -424,7 +424,7 @@ async fn main() -> Result<(), Error> {
                         if chunk.sha == downloaded_chunk_sha {
                             Ok(vz_data.to_owned())
                         } else {
-                            Err("sha dismatch")
+                            Err("sha mismatch")
                         }
                     })
                     .await
