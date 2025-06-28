@@ -12,12 +12,12 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use liblzma::stream::{Action::Run, Filters, Stream};
 use protobuf::Message;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use serde_json::Value;
-use sha1_smol::Sha1;
+use sha1::{Digest, Sha1};
 use std::{
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -31,24 +31,31 @@ type Error = Box<dyn std::error::Error>;
 const INVALID_CHARS: &[char] = &['/', ':', '*', '?', '"', '<', '>', '|'];
 static NEXT_URL_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+const MAGIC_LZMA: [u8; 3] = [86, 90, 97]; // "VZa"
+const MAGIC_ZSTD: [u8; 4] = [86, 83, 90, 97]; // "VSZa"
+const MAGIC_ZIP: [u8; 4] = [80, 75, 3, 4]; // "PK\x03\x04"
+
 #[derive(Parser)]
 struct Args {
     #[arg(short = 'm', long, required = true)]
     manifest_path: String,
     #[arg(short = 'k', long, required = true)]
     depot_key: String,
-    #[arg(short = 'o', long, default_value = "default", required = false)]
+    #[arg(short = 'o', long, default_value = "default")]
     output_path: String,
-    #[arg(short = 'r', long, default_value = "3", required = false)]
+    #[arg(short = 'p', long)]
+    proxy_url: Option<String>,
+    #[arg(short = 'r', long, default_value = "3")]
     retry_num: u32,
     cdn_url_list: Option<Vec<String>>,
 }
 impl Args {
-    pub fn get_args(&self) -> (&str, &str, &str, u32, &Option<Vec<String>>) {
+    pub fn get_args(&self) -> (&str, &str, &str, &Option<String>, u32, &Option<Vec<String>>) {
         (
             &self.manifest_path,
             &self.depot_key,
             &self.output_path,
+            &self.proxy_url,
             self.retry_num,
             &self.cdn_url_list,
         )
@@ -194,7 +201,7 @@ impl Decrypt {
     fn ecb_decrypt(&self, iv: &[u8]) -> Result<Vec<u8>, Error> {
         let key = HEXLOWER.decode(&self.key)?;
         let mut block = GenericArray::from_slice(iv).to_owned();
-        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&key).unwrap();
+        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&key)?;
         cipher.decrypt_block_mut(&mut block);
         let data = block.to_vec();
         Ok(data)
@@ -202,26 +209,20 @@ impl Decrypt {
 
     fn cbc_decrypt(&self, mut data: Vec<u8>) -> Result<Vec<u8>, Error> {
         let key = HEXLOWER.decode(&self.key)?;
-        let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&key, &self.iv).unwrap();
-        let _ = cipher.decrypt_padded_mut::<Pkcs7>(&mut data);
-        Ok(data)
+        let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&key, &self.iv)
+            .map_err(|e| format!("Invalid key or IV: {:?}", e))?;
+        let decrypted_data = cipher
+            .decrypt_padded_mut::<Pkcs7>(&mut data)
+            .map_err(|e| format!("Unpadding error: {:?}", e))?;
+        Ok(decrypted_data.to_vec())
     }
 
     pub fn decrypt_chunk(&mut self) -> Result<Vec<u8>, Error> {
         let decrypted_iv = self.ecb_decrypt(&self.encrypted_data[..16])?;
         self.set_iv(decrypted_iv);
         let data = self.encrypted_data[16..].to_vec();
-        self.encrypted_data = self.cbc_decrypt(data)?;
-        let data_len = self.encrypted_data.len() as usize;
-        if self.encrypted_data[..3] == [86, 90, 97]
-            && data_len % 16 == 0
-            && self.encrypted_data[data_len - 2..data_len] != [122, 118]
-        {
-            let pad_value = self.encrypted_data[data_len - 1];
-            let pad_len = pad_value as usize;
-            return Ok(self.encrypted_data[..data_len - pad_len].to_owned());
-        }
-        Ok(self.encrypted_data.to_owned())
+        let decrypted_data = self.cbc_decrypt(data)?;
+        Ok(decrypted_data)
     }
 
     pub fn decrypt_file_name(&mut self) -> Result<String, Error> {
@@ -231,41 +232,23 @@ impl Decrypt {
             .filter(|c| !c.is_control() && !INVALID_CHARS.contains(c))
             .collect::<String>())
     }
-
-    pub fn decrypt_vz(&self) -> Result<Vec<u8>, Error> {
-        let mut header = [0u8; 4];
-        let data_header = &self.encrypted_data[..4];
-        header.clone_from_slice(data_header);
-        if header[..3] == [86, 90, 97] {
-            let mut filter = Filters::new();
-            let filter = filter.lzma1_properties(&self.encrypted_data[7..12])?;
-            let raw_data = &self.encrypted_data[12..&self.encrypted_data.len() - 9];
-            let mut decrypted_data = Vec::with_capacity(1048576);
-            match Stream::new_raw_decoder(&filter)?.process_vec(raw_data, &mut decrypted_data, Run)
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("vz Error: {}", e);
-                }
-            }
-            return Ok(decrypted_data);
-        } else if header == [80, 75, 3, 4] {
-            Err("vz Zip file detected".into())
-        } else {
-            // if &self.encrypted_data.len() ==
-            let mut file = File::create("error.unknown")?;
-            let _ = file.write_all(&self.encrypted_data);
-            Err("vz Unknown file format detected".into())
-        }
-    }
 }
 
-fn set_client() -> Result<Client, Error> {
-    Ok(reqwest::ClientBuilder::new()
-        .use_native_tls()
-        .tcp_keepalive(Duration::from_secs(20))
-        .timeout(Duration::from_secs(30))
-        .build()?)
+fn set_client(proxy_url: &Option<String>) -> Result<Client, Error> {
+    match proxy_url {
+        Some(proxy_url) => Ok(reqwest::ClientBuilder::new()
+            .use_native_tls()
+            .tcp_keepalive(Duration::from_secs(20))
+            .timeout(Duration::from_secs(30))
+            .proxy(Proxy::all(proxy_url)?)
+            .build()?),
+        None => Ok(reqwest::ClientBuilder::new()
+            .use_native_tls()
+            .tcp_keepalive(Duration::from_secs(20))
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()?),
+    }
 }
 
 async fn get_steam_content_url_list(client: &Client) -> Result<Vec<String>, Error> {
@@ -309,12 +292,19 @@ fn prepare_output_file(
     };
 
     if path.exists() {
-        let mut bufreader = BufReader::new(File::open(&path)?);
-        let mut file_content = Vec::new();
-        let _ = bufreader.read_to_end(&mut file_content);
-        let mut hasher = Sha1::new();
-        hasher.update(&file_content);
-        let downloaded_file_sha = hasher.digest().to_string();
+        let mut file = File::open(&path)?;
+        let mut hasher = Sha1::default();
+        let mut buffer = vec![0u8; 10485760];
+
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        let downloaded_file_sha = HEXLOWER.encode(&hasher.finalize());
         if file_sha == downloaded_file_sha {
             println!("{} already downloaded", file_name);
             return Ok((true, path));
@@ -331,15 +321,79 @@ fn prepare_output_file(
     Ok((false, path))
 }
 
+fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
+    let mut header = [0u8; 4];
+    let data_header = &compressed_data[..4];
+    header.clone_from_slice(data_header);
+    let compressed_data_len = compressed_data.len();
+    if header[..3] == MAGIC_LZMA {
+        let raw_data = &compressed_data[12..compressed_data_len - 10];
+
+        let decrypted_size_bytes =
+            &compressed_data[compressed_data_len - 6..compressed_data_len - 2];
+        let decrypted_size = u32::from_le_bytes(decrypted_size_bytes.try_into().unwrap());
+        let mut decrypted_data = Vec::with_capacity(decrypted_size as usize);
+        let crc_bytes = &compressed_data[compressed_data_len - 10..compressed_data_len - 6];
+        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+
+        let mut filter = Filters::new();
+        let filter = filter.lzma1_properties(&compressed_data[7..12])?;
+        Stream::new_raw_decoder(&filter)?.process_vec(raw_data, &mut decrypted_data, Run)?;
+
+        if crc == crc32fast::hash(&decrypted_data) {
+            return Ok(decrypted_data);
+        } else {
+            return Err("decompressed lzma data CRC mismatch".into());
+        }
+    } else if header == MAGIC_ZSTD {
+        let raw_data = &compressed_data[8..compressed_data_len - 15];
+
+        let decrypted_size_bytes =
+            &compressed_data[compressed_data_len - 11..compressed_data_len - 7];
+        let decrypted_size = u32::from_le_bytes(decrypted_size_bytes.try_into().unwrap());
+        let mut decrypted_data = Vec::with_capacity(decrypted_size as usize);
+        let crc_bytes = &compressed_data[4..8];
+        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+
+        zstd::stream::copy_decode(raw_data, &mut decrypted_data)?;
+
+        if crc == crc32fast::hash(&decrypted_data) {
+            return Ok(decrypted_data);
+        } else {
+            return Err("decompressed zstd data CRC mismatch".into());
+        }
+    } else if header == MAGIC_ZIP {
+        let raw_data = Cursor::new(&compressed_data);
+
+        let mut archive = zip::ZipArchive::new(raw_data)?;
+        let mut file = archive.by_index(0)?;
+
+        let crc = file.crc32();
+        let decrypted_size = file.size() as usize;
+        let mut decrypted_data = Vec::with_capacity(decrypted_size);
+
+        file.read_to_end(&mut decrypted_data)?;
+
+        if crc == crc32fast::hash(&decrypted_data) {
+            return Ok(decrypted_data);
+        } else {
+            return Err("decompressed zip data CRC mismatch".into());
+        }
+    } else {
+        Err("vz Unknown file format detected".into())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let (manifest_path, depot_key, output_path, retry_num, cdn_url_list) = args.get_args();
+    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_url_list) =
+        args.get_args();
 
     let manifest = Manifest::new(manifest_path);
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
 
-    let client = set_client()?;
+    let client = set_client(proxy_url)?;
 
     let steam_content_url_list = match cdn_url_list {
         Some(cdn_url_list) => cdn_url_list.to_owned(),
@@ -414,17 +468,13 @@ async fn main() -> Result<(), Error> {
                         let decrypted_data =
                             decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
 
-                        let decrypt_vz = Decrypt::new(decrypted_data);
-                        let vz_data = &decrypt_vz.decrypt_vz().expect("Failed to decrypt vz")
-                            [..chunk_info.original_size as usize];
+                        let decompressed_data =
+                            decompress(decrypted_data).expect("Failed to decompress chunk");
 
-                        let mut hasher = Sha1::new();
-                        hasher.update(&vz_data);
-                        let downloaded_chunk_sha = hasher.digest().bytes();
-                        if chunk.sha == downloaded_chunk_sha {
-                            Ok(vz_data.to_owned())
+                        if decompressed_data.len() == chunk_info.original_size as usize {
+                            Ok(decompressed_data.to_owned())
                         } else {
-                            Err("sha mismatch")
+                            Err("size mismatch")
                         }
                     })
                     .await

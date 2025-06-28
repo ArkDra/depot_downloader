@@ -34,13 +34,14 @@ async_depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890
 or
 
 ```bash
-async_depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890 -o output_directory -r 3 steampipe.akamaized.net fastly.cdn.steampipe.steamcontent.com
+async_depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890 -o output_directory -r 3 -p http://127.0.0.1:1080 steampipe.akamaized.net fastly.cdn.steampipe.steamcontent.com
 ```
 
 #### Options
 - `-m, --manifest-path <MANIFEST_PATH>`: Manifest file path (Required)
 - `-k, --depot-key <DEPOT_KEY>`: Depot decryption key (Required)
 - `-o, --output-path <OUTPUT_PATH>`: Output directory
+- `-p, --proxy_url <PROXY_URL>`: Proxy URL
 - `-r, --retry-num <RETRY_NUM>`: Retry number
 - Other options may be available; run with `-h` for details.
 
