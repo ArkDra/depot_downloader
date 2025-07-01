@@ -6,7 +6,7 @@ use aes::{
         BlockDecryptMut, KeyInit, KeyIvInit, block_padding::Pkcs7, generic_array::GenericArray,
     },
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use data_encoding::{BASE64_MIME, HEXLOWER};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -47,18 +47,44 @@ struct Args {
     proxy_url: Option<String>,
     #[arg(short = 'r', long, default_value = "3")]
     retry_num: u32,
-    cdn_url_list: Option<Vec<String>>,
+    #[command(subcommand)]
+    cdn: Option<CdnCommends>,
 }
 impl Args {
-    pub fn get_args(&self) -> (&str, &str, &str, &Option<String>, u32, &Option<Vec<String>>) {
+    pub fn get_args(&self) -> (&str, &str, &str, &Option<String>, u32, Option<Vec<(String, String)>>) {
+
+        let cdn_pairs = match &self.cdn {
+            Some(CdnCommends::Cdn { cdn_url, cdn_url_suffix }) => {
+                if cdn_url.len() != cdn_url_suffix.len() {
+                    panic!("The number of cdn_url and cdn_url_suffix must be the same");
+                }
+                Some(
+                    cdn_url
+                        .iter().cloned()
+                        .zip(cdn_url_suffix.iter().cloned())
+                        .collect(),
+                )
+            }
+            None => None,
+        };
         (
             &self.manifest_path,
             &self.depot_key,
             &self.output_path,
             &self.proxy_url,
             self.retry_num,
-            &self.cdn_url_list,
+            cdn_pairs,
         )
+    }
+}
+
+#[derive(Subcommand)]
+enum CdnCommends { 
+    Cdn {
+       #[arg(short = 'u', long, required = true, num_args = 1.., value_delimiter = ',')]
+        cdn_url: Vec<String>,
+        #[arg(short = 's', long, required = true, num_args = 1.., value_delimiter = ',')]
+        cdn_url_suffix: Vec<String>,
     }
 }
 
@@ -89,18 +115,19 @@ impl ChunkInfo {
 
     pub async fn get_chunk(
         &self,
-        steam_content_url_list: Vec<String>,
+        cdn_url_list: Vec<String>,
         client: &Client,
         retry_num: u32,
+        cdn_url_suffix_list: Vec<String>,
     ) -> Vec<u8> {
-        let url_list_len = steam_content_url_list.len();
+        let url_list_len = cdn_url_list.len();
         let mut index = NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed) % url_list_len;
         let mut retry_count = 0;
 
         loop {
             let url = format!(
-                "http://{}/depot/{}/chunk/{}",
-                &steam_content_url_list[index], self.depot_id, self.content_sha
+                "http://{}/depot/{}/chunk/{}{}",
+                &cdn_url_list[index], self.depot_id, self.content_sha, &cdn_url_suffix_list[index]
             );
             match client.get(&url).send().await {
                 Ok(res) => match res.bytes().await {
@@ -251,7 +278,7 @@ fn set_client(proxy_url: &Option<String>) -> Result<Client, Error> {
     }
 }
 
-async fn get_steam_content_url_list(client: &Client) -> Result<Vec<String>, Error> {
+async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
     let url =
         "https://api.steampowered.com/icontentserverdirectoryservice/getserversforsteampipe/v1";
     let response = client.get(url).send().await?;
@@ -387,7 +414,7 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_url_list) =
+    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs) =
         args.get_args();
 
     let manifest = Manifest::new(manifest_path);
@@ -395,9 +422,13 @@ async fn main() -> Result<(), Error> {
 
     let client = set_client(proxy_url)?;
 
-    let steam_content_url_list = match cdn_url_list {
-        Some(cdn_url_list) => cdn_url_list.to_owned(),
-        None => get_steam_content_url_list(&client).await?,
+    let (cdn_url_list, cdn_url_suffix_list): (Vec<String>, Vec<String>) = match cdn_pairs {
+        Some(pairs) => pairs.into_iter().unzip(),
+        None => {
+            let urls = get_cdn_url_list(&client).await?;
+            let urls_len = urls.len();
+            (urls, vec!["".to_string(); urls_len])
+        }
     };
 
     let cpu_num = num_cpus::get();
@@ -434,7 +465,8 @@ async fn main() -> Result<(), Error> {
 
             let depot_key_for_closure = depot_key;
             let client_for_closure = &client;
-            let steam_content_url_list_for_closure = &steam_content_url_list;
+            let cdn_url_suffix_list_for_closure = &cdn_url_suffix_list;
+            let cdn_url_list_for_closure = &cdn_url_list;
             let path_for_closure = &path;
             let pb_for_closure = &pb;
 
@@ -450,9 +482,10 @@ async fn main() -> Result<(), Error> {
 
                     let data = chunk_info
                         .get_chunk(
-                            steam_content_url_list_for_closure.to_owned(),
+                            cdn_url_list_for_closure.to_owned(),
                             &client_for_closure,
                             retry_num,
+                            cdn_url_suffix_list_for_closure.to_owned()
                         )
                         .await;
 
