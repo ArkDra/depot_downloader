@@ -14,7 +14,7 @@ data-encoding = "2.9.0"
 ecb = "0.1.2"
 futures = "0.3.31"
 indicatif = { version = "0.17.11" }
-liblzma = "0.4.1"
+liblzma = { version = "0.4.1", features = ["parallel"] }
 native-tls = "0.2.14"
 num_cpus = "1.17.0"
 protobuf = "3.7.2"

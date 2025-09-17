@@ -44,6 +44,7 @@ depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890 -o output_dir
 - `-o, --output-path <OUTPUT_PATH>`: Output directory
 - `-p, --proxy_url <PROXY_URL>`: Proxy URL
 - `-r, --retry-num <RETRY_NUM>`: Retry number
+- `-f, --file-names <FILE_NAMES>`: Selected file names
 - Other options may be available; run with `-h` for details.
 
 #### CDN Parameters (Optional)

@@ -29,6 +29,9 @@ use tokio::{
 type Error = Box<dyn std::error::Error>;
 #[cfg(windows)]
 const INVALID_CHARS: &[char] = &['/', ':', '*', '?', '"', '<', '>', '|'];
+#[cfg(not(windows))]
+const INVALID_CHARS: &[char] = &['/'];
+
 static NEXT_URL_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 const MAGIC_LZMA: [u8; 3] = [86, 90, 97]; // "VZa"
@@ -47,23 +50,48 @@ struct Args {
     proxy_url: Option<String>,
     #[arg(short = 'r', long, default_value = "3")]
     retry_num: u32,
+    #[arg(short = 'f', long, num_args = 1.., value_delimiter = ',')]
+    file_names: Option<Vec<String>>,
     #[command(subcommand)]
-    cdn: Option<CdnCommends>,
+    command: Option<Commands>,
 }
 impl Args {
-    pub fn get_args(&self) -> (&str, &str, &str, &Option<String>, u32, Option<Vec<(String, String)>>) {
-
-        let cdn_pairs = match &self.cdn {
-            Some(CdnCommends::Cdn { cdn_url, cdn_url_suffix }) => {
-                if cdn_url.len() != cdn_url_suffix.len() {
-                    panic!("The number of cdn_url and cdn_url_suffix must be the same");
+    pub fn get_args(
+        &self,
+    ) -> (
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        u32,
+        Option<Vec<(String, String)>>,
+        Option<&[String]>,
+    ) {
+        let cdn_pairs = match &self.command {
+            Some(Commands::Cdn {
+                cdn_url,
+                cdn_url_suffix,
+            }) => {
+                if let Some(cdn_url_suffix) = cdn_url_suffix {
+                    if cdn_url.len() != cdn_url_suffix.len() {
+                        panic!("The number of cdn_url and cdn_url_suffix must be the same");
+                    }
+                    Some(
+                        cdn_url
+                            .iter()
+                            .cloned()
+                            .zip(cdn_url_suffix.iter().cloned())
+                            .collect(),
+                    )
+                } else {
+                    Some(
+                        cdn_url
+                            .iter()
+                            .cloned()
+                            .zip(std::iter::repeat("".to_string()).take(cdn_url.len()))
+                            .collect(),
+                    )
                 }
-                Some(
-                    cdn_url
-                        .iter().cloned()
-                        .zip(cdn_url_suffix.iter().cloned())
-                        .collect(),
-                )
             }
             None => None,
         };
@@ -71,24 +99,24 @@ impl Args {
             &self.manifest_path,
             &self.depot_key,
             &self.output_path,
-            &self.proxy_url,
+            self.proxy_url.as_deref(),
             self.retry_num,
             cdn_pairs,
+            self.file_names.as_deref(),
         )
     }
 }
 
 #[derive(Subcommand)]
-enum CdnCommends { 
+enum Commands {
     Cdn {
-       #[arg(short = 'u', long, required = true, num_args = 1.., value_delimiter = ',')]
+        #[arg(short = 'u', long, num_args = 1.., value_delimiter = ',')]
         cdn_url: Vec<String>,
-        #[arg(short = 's', long, required = true, num_args = 1.., value_delimiter = ',')]
-        cdn_url_suffix: Vec<String>,
-    }
+        #[arg(short = 's', long, num_args = 1.., value_delimiter = ',')]
+        cdn_url_suffix: Option<Vec<String>>,
+    },
 }
 
-#[derive(Clone)]
 struct ChunkInfo {
     offset: u64,
     original_size: u32,
@@ -261,7 +289,7 @@ impl Decrypt {
     }
 }
 
-fn set_client(proxy_url: &Option<String>) -> Result<Client, Error> {
+fn set_client(proxy_url: Option<&str>) -> Result<Client, Error> {
     match proxy_url {
         Some(proxy_url) => Ok(reqwest::ClientBuilder::new()
             .use_native_tls()
@@ -308,14 +336,13 @@ fn prepare_output_file(
     output_path: &str,
     file_size: u64,
 ) -> Result<(bool, PathBuf), Error> {
-    let depot_id_string = depot_id.to_string();
     let path = if output_path == "default" {
         let mut path_buf = std::env::current_dir()?;
-        path_buf.push(depot_id_string);
+        path_buf.push(depot_id.to_string());
         path_buf.push(file_name);
         path_buf
     } else {
-        Path::new(output_path).join(depot_id_string).join(file_name)
+        Path::new(output_path).join(file_name)
     };
 
     if path.exists() {
@@ -364,7 +391,7 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
 
         let mut filter = Filters::new();
-        let filter = filter.lzma1_properties(&compressed_data[7..12])?;
+        filter.lzma1_properties(&compressed_data[7..12])?;
         Stream::new_raw_decoder(&filter)?.process_vec(raw_data, &mut decrypted_data, Run)?;
 
         if crc == crc32fast::hash(&decrypted_data) {
@@ -407,14 +434,14 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
             return Err("decompressed zip data CRC mismatch".into());
         }
     } else {
-        Err("vz Unknown file format detected".into())
+        Err("Unknown file format detected".into())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs) =
+    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs, file_names) =
         args.get_args();
 
     let manifest = Manifest::new(manifest_path);
@@ -432,7 +459,9 @@ async fn main() -> Result<(), Error> {
     };
 
     let cpu_num = num_cpus::get();
-
+    let mut all_chunks = Vec::new();
+    let mut total_download_size = 0;
+    // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
         if file.flags == 0 {
             let file_name = if metadata.filenames_encrypted {
@@ -444,6 +473,16 @@ async fn main() -> Result<(), Error> {
             } else {
                 file.filename
             };
+
+            if let Some(file_names) = file_names {
+                let normalized_file_name = file_name.replace("\\", "/");
+                if !file_names
+                    .iter()
+                    .any(|f| f.replace("\\", "/") == normalized_file_name)
+                {
+                    continue;
+                }
+            }
 
             let file_sha = HEXLOWER.encode(&file.sha_content);
             let (is_exist, path) = prepare_output_file(
@@ -457,75 +496,89 @@ async fn main() -> Result<(), Error> {
                 continue;
             }
 
-            let pb = ProgressBar::new(file.size).with_style(ProgressStyle::with_template(
-                "[{elapsed_precise}] [{msg}] [{bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-            )?
-            .progress_chars("#>-"));
-            pb.set_message(file_name);
+            total_download_size += file.size;
 
-            let depot_key_for_closure = depot_key;
-            let client_for_closure = &client;
-            let cdn_url_suffix_list_for_closure = &cdn_url_suffix_list;
-            let cdn_url_list_for_closure = &cdn_url_list;
-            let path_for_closure = &path;
-            let pb_for_closure = &pb;
+            let mut file_chunks = Vec::with_capacity(file.chunks.len());
+            // Step 2: Extract all chunk information
+            for chunk in file.chunks {
+                let chunk_info = ChunkInfo::new(
+                    chunk.offset,
+                    chunk.cb_original,
+                    metadata.depot_id,
+                    path.to_owned(),
+                    HEXLOWER.encode(&chunk.sha),
+                );
+                file_chunks.push(chunk_info);
+            }
 
-            stream::iter(file.chunks)
-                .map(|chunk| async move {
-                    let chunk_info = ChunkInfo::new(
-                        chunk.offset,
-                        chunk.cb_original,
-                        metadata.depot_id,
-                        path_for_closure.to_owned(),
-                        HEXLOWER.encode(&chunk.sha),
-                    );
-
-                    let data = chunk_info
-                        .get_chunk(
-                            cdn_url_list_for_closure.to_owned(),
-                            &client_for_closure,
-                            retry_num,
-                            cdn_url_suffix_list_for_closure.to_owned()
-                        )
-                        .await;
-
-                    if data.len() == 0 {
-                        return;
-                    }
-
-                    let depot_key_for_spawn = depot_key_for_closure.to_owned();
-
-                    let decrypted_data = spawn_blocking(move || {
-                        let mut decrypt = Decrypt::new(data);
-                        decrypt.set_key(depot_key_for_spawn.into_bytes());
-                        let decrypted_data =
-                            decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
-
-                        let decompressed_data =
-                            decompress(decrypted_data).expect("Failed to decompress chunk");
-
-                        if decompressed_data.len() == chunk_info.original_size as usize {
-                            Ok(decompressed_data.to_owned())
-                        } else {
-                            Err("size mismatch")
-                        }
-                    })
-                    .await
-                    .unwrap()
-                    .expect("Failed to decrypt chunk");
-
-                    chunk_info
-                        .write_chunk_into_file(decrypted_data)
-                        .await
-                        .expect("Failed to write chunk into file");
-
-                    pb_for_closure.inc(chunk.cb_original.into());
-                })
-                .buffer_unordered(cpu_num * 4)
-                .collect::<Vec<_>>()
-                .await;
+            all_chunks.extend(file_chunks);
         }
     }
+
+    let pb = ProgressBar::new(total_download_size).with_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )?
+        .progress_chars("#>-"),
+    );
+
+    let depot_key_for_closure = depot_key;
+    let client_for_closure = &client;
+    let cdn_url_suffix_list_for_closure = &cdn_url_suffix_list;
+    let cdn_url_list_for_closure = &cdn_url_list;
+    let pb_for_closure = &pb;
+    // Step 3: download and process all chunks
+    stream::iter(all_chunks)
+        .map(|chunk_info| async move {
+            let data = chunk_info
+                .get_chunk(
+                    cdn_url_list_for_closure.to_owned(),
+                    &client_for_closure,
+                    retry_num,
+                    cdn_url_suffix_list_for_closure.to_owned(),
+                )
+                .await;
+
+            if data.len() == 0 {
+                return;
+            }
+
+            let depot_key_for_spawn = depot_key_for_closure.to_owned();
+
+            let decrypted_data = spawn_blocking(move || {
+                let mut decrypt = Decrypt::new(data);
+                decrypt.set_key(depot_key_for_spawn.into_bytes());
+                let decrypted_data = decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
+
+                match decompress(decrypted_data) {
+                    Ok(data) => {
+                        if data.len() == chunk_info.original_size as usize {
+                            Ok(data)
+                        } else {
+                            Err(format!(
+                                "Size mismatch: expected {} got {}",
+                                chunk_info.original_size,
+                                data.len()
+                            ))
+                        }
+                    }
+                    Err(e) => Err(format!("Failed to decompress chunk: {:?}", e)),
+                }
+            })
+            .await
+            .unwrap()
+            .expect("Failed to process chunk");
+
+            chunk_info
+                .write_chunk_into_file(decrypted_data)
+                .await
+                .expect("Failed to write chunk into file");
+
+            pb_for_closure.inc(chunk_info.original_size.into());
+        })
+        .buffer_unordered(cpu_num * 4)
+        .collect::<Vec<_>>()
+        .await;
 
     Ok(())
 }
