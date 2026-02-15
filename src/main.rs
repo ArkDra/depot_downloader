@@ -84,18 +84,19 @@ struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
 }
+
+struct AppConfig<'a> {
+    manifest_path: &'a str,
+    depot_key: &'a str,
+    output_path: &'a str,
+    proxy_url: Option<&'a str>,
+    retry_num: u32,
+    cdn_pairs: Option<Vec<(String, String)>>,
+    file_names: Option<&'a [String]>,
+}
+
 impl Args {
-    pub fn get_args(
-        &self,
-    ) -> (
-        &str,
-        &str,
-        &str,
-        Option<&str>,
-        u32,
-        Option<Vec<(String, String)>>,
-        Option<&[String]>,
-    ) {
+    pub fn get_args(&self) -> AppConfig<'_> {
         let cdn_pairs = match &self.command {
             Some(Commands::Cdn {
                 cdn_url,
@@ -124,15 +125,15 @@ impl Args {
             }
             None => None,
         };
-        (
-            &self.manifest_path,
-            &self.depot_key,
-            &self.output_path,
-            self.proxy_url.as_deref(),
-            self.retry_num,
+        AppConfig {
+            manifest_path: &self.manifest_path,
+            depot_key: &self.depot_key,
+            output_path: &self.output_path,
+            proxy_url: self.proxy_url.as_deref(),
+            retry_num: self.retry_num,
             cdn_pairs,
-            self.file_names.as_deref(),
-        )
+            file_names: self.file_names.as_deref(),
+        }
     }
 }
 
@@ -480,22 +481,22 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs, file_names) =
-        args.get_args();
-    let decoded_depot_key = HEXLOWER.decode(depot_key.as_bytes())?;
-    let normalized_file_names = file_names.map(|names| {
+    let config = args.get_args();
+    let decoded_depot_key = HEXLOWER.decode(config.depot_key.as_bytes())?;
+    let normalized_file_names = config.file_names.map(|names| {
         names
             .iter()
             .map(|name| name.replace("\\", "/"))
             .collect::<HashSet<_>>()
     });
 
-    let manifest = Manifest::new(manifest_path)?;
+    let manifest = Manifest::new(config.manifest_path)?;
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
 
-    let client = set_client(proxy_url)?;
+    let client = set_client(config.proxy_url)?;
 
-    let (cdn_url_list, cdn_url_suffix_list): (Arc<[String]>, Arc<[String]>) = match cdn_pairs {
+    let (cdn_url_list, cdn_url_suffix_list): (Arc<[String]>, Arc<[String]>) = match config.cdn_pairs
+    {
         Some(pairs) => {
             let (urls, suffixes): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
             (urls.into(), suffixes.into())
@@ -534,7 +535,7 @@ async fn main() -> Result<(), Error> {
                 &file_name,
                 file_sha,
                 metadata.depot_id,
-                output_path,
+                config.output_path,
                 file.size,
             )?;
             if is_exist {
@@ -583,7 +584,7 @@ async fn main() -> Result<(), Error> {
                     .get_chunk(
                         cdn_url_list_for_task.as_ref(),
                         client_for_closure,
-                        retry_num,
+                        config.retry_num,
                         cdn_url_suffix_list_for_task.as_ref(),
                     )
                     .await;
