@@ -16,6 +16,7 @@ use reqwest::{Client, Proxy};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -443,6 +444,12 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs, file_names) =
         args.get_args();
+    let normalized_file_names = file_names.map(|names| {
+        names
+            .iter()
+            .map(|name| name.replace("\\", "/"))
+            .collect::<HashSet<_>>()
+    });
 
     let manifest = Manifest::new(manifest_path);
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
@@ -474,12 +481,9 @@ async fn main() -> Result<(), Error> {
                 file.filename
             };
 
-            if let Some(file_names) = file_names {
+            if let Some(file_names) = normalized_file_names.as_ref() {
                 let normalized_file_name = file_name.replace("\\", "/");
-                if !file_names
-                    .iter()
-                    .any(|f| f.replace("\\", "/") == normalized_file_name)
-                {
+                if !file_names.contains(&normalized_file_name) {
                     continue;
                 }
             }
