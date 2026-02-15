@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
 };
 use tokio::{
@@ -66,6 +66,8 @@ static NEXT_URL_INDEX: AtomicUsize = AtomicUsize::new(0);
 const MAGIC_LZMA: [u8; 3] = [86, 90, 97]; // "VZa"
 const MAGIC_ZSTD: [u8; 4] = [86, 83, 90, 97]; // "VSZa"
 const MAGIC_ZIP: [u8; 4] = [80, 75, 3, 4]; // "PK\x03\x04"
+const INITIAL_BACKOFF_MS: u64 = 100;
+const MAX_BACKOFF_MS: u64 = 2_000;
 
 #[derive(Parser)]
 struct Args {
@@ -154,6 +156,56 @@ struct ChunkInfo {
     file_path: PathBuf,
     content_sha: String,
 }
+
+struct CdnHealth {
+    scores: Vec<AtomicU32>,
+}
+
+impl CdnHealth {
+    fn new(host_count: usize) -> Self {
+        let mut scores = Vec::with_capacity(host_count);
+        for _ in 0..host_count {
+            scores.push(AtomicU32::new(0));
+        }
+        Self { scores }
+    }
+
+    fn mark_failure(&self, index: usize) {
+        if let Some(score) = self.scores.get(index) {
+            let _ = score.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(2))
+            });
+        }
+    }
+
+    fn mark_success(&self, index: usize) {
+        if let Some(score) = self.scores.get(index) {
+            let _ = score.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+        }
+    }
+
+    fn pick_best_index(&self, seed: usize) -> usize {
+        let len = self.scores.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut best_index = seed % len;
+        let mut best_score = self.scores[best_index].load(Ordering::Relaxed);
+        for offset in 1..len {
+            let index = (seed + offset) % len;
+            let score = self.scores[index].load(Ordering::Relaxed);
+            if score < best_score {
+                best_score = score;
+                best_index = index;
+            }
+        }
+        best_index
+    }
+}
+
 impl ChunkInfo {
     pub fn new(
         offset: u64,
@@ -177,10 +229,17 @@ impl ChunkInfo {
         client: &Client,
         retry_num: u32,
         cdn_url_suffix_list: &[String],
+        cdn_health: &CdnHealth,
     ) -> Vec<u8> {
         let url_list_len = cdn_url_list.len();
-        let mut index = NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed) % url_list_len;
+        if url_list_len == 0 || url_list_len != cdn_url_suffix_list.len() {
+            eprintln!("Invalid CDN URL/suffix configuration.");
+            return vec![];
+        }
+
+        let mut index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
         let mut retry_count = 0;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
 
         loop {
             let url = format!(
@@ -188,25 +247,33 @@ impl ChunkInfo {
                 &cdn_url_list[index], self.depot_id, self.content_sha, &cdn_url_suffix_list[index]
             );
             match client.get(&url).send().await {
-                Ok(res) => match res.bytes().await {
-                    Ok(body_data) => {
-                        if body_data.len() != 0 {
-                            return body_data.to_vec();
+                Ok(res) => match res.error_for_status() {
+                    Ok(ok_res) => match ok_res.bytes().await {
+                        Ok(body_data) => {
+                            if body_data.len() != 0 {
+                                cdn_health.mark_success(index);
+                                return body_data.to_vec();
+                            }
+                            cdn_health.mark_failure(index);
                         }
-                    }
+                        Err(_) => {
+                            cdn_health.mark_failure(index);
+                        }
+                    },
                     Err(_) => {
-                        // eprintln!("Failed to read response body: {}", e);
+                        cdn_health.mark_failure(index);
                     }
                 },
                 Err(_) => {
-                    // eprintln!("Request error: {}", e);
+                    cdn_health.mark_failure(index);
                 }
             }
 
             retry_count += 1;
             if retry_count < retry_num {
-                sleep(Duration::from_millis(200)).await;
-                index = (index + 1) % url_list_len;
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
+                index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
             } else {
                 eprintln!("Max retries reached. Aborting.");
                 return vec![];
@@ -569,9 +636,11 @@ async fn main() -> Result<(), Error> {
     );
 
     let depot_key_for_closure = decoded_depot_key;
+    let retry_num = config.retry_num;
     let client_for_closure = &client;
     let cdn_url_suffix_list_for_closure = Arc::clone(&cdn_url_suffix_list);
     let cdn_url_list_for_closure = Arc::clone(&cdn_url_list);
+    let cdn_health_for_closure = Arc::new(CdnHealth::new(cdn_url_list_for_closure.len()));
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
     let chunk_results = stream::iter(all_chunks)
@@ -579,13 +648,15 @@ async fn main() -> Result<(), Error> {
             let depot_key_for_task = depot_key_for_closure.clone();
             let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
             let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list_for_closure);
+            let cdn_health_for_task = Arc::clone(&cdn_health_for_closure);
             async move {
                 let data = chunk_info
                     .get_chunk(
                         cdn_url_list_for_task.as_ref(),
                         client_for_closure,
-                        config.retry_num,
+                        retry_num,
                         cdn_url_suffix_list_for_task.as_ref(),
+                        cdn_health_for_task.as_ref(),
                     )
                     .await;
 
