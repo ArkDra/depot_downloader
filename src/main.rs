@@ -20,7 +20,10 @@ use std::{
     fs::{self, File},
     io::{BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -144,10 +147,10 @@ impl ChunkInfo {
 
     pub async fn get_chunk(
         &self,
-        cdn_url_list: Vec<String>,
+        cdn_url_list: &[String],
         client: &Client,
         retry_num: u32,
-        cdn_url_suffix_list: Vec<String>,
+        cdn_url_suffix_list: &[String],
     ) -> Vec<u8> {
         let url_list_len = cdn_url_list.len();
         let mut index = NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed) % url_list_len;
@@ -455,12 +458,15 @@ async fn main() -> Result<(), Error> {
 
     let client = set_client(proxy_url)?;
 
-    let (cdn_url_list, cdn_url_suffix_list): (Vec<String>, Vec<String>) = match cdn_pairs {
-        Some(pairs) => pairs.into_iter().unzip(),
+    let (cdn_url_list, cdn_url_suffix_list): (Arc<[String]>, Arc<[String]>) = match cdn_pairs {
+        Some(pairs) => {
+            let (urls, suffixes): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
+            (urls.into(), suffixes.into())
+        }
         None => {
             let urls = get_cdn_url_list(&client).await?;
             let urls_len = urls.len();
-            (urls, vec!["".to_string(); urls_len])
+            (urls.into(), vec!["".to_string(); urls_len].into())
         }
     };
 
@@ -526,20 +532,22 @@ async fn main() -> Result<(), Error> {
 
     let depot_key_for_closure = decoded_depot_key;
     let client_for_closure = &client;
-    let cdn_url_suffix_list_for_closure = &cdn_url_suffix_list;
-    let cdn_url_list_for_closure = &cdn_url_list;
+    let cdn_url_suffix_list_for_closure = Arc::clone(&cdn_url_suffix_list);
+    let cdn_url_list_for_closure = Arc::clone(&cdn_url_list);
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
     stream::iter(all_chunks)
         .map(|chunk_info| {
             let depot_key_for_task = depot_key_for_closure.clone();
+            let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
+            let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list_for_closure);
             async move {
                 let data = chunk_info
                     .get_chunk(
-                        cdn_url_list_for_closure.to_owned(),
-                        &client_for_closure,
+                        cdn_url_list_for_task.as_ref(),
+                        client_for_closure,
                         retry_num,
-                        cdn_url_suffix_list_for_closure.to_owned(),
+                        cdn_url_suffix_list_for_task.as_ref(),
                     )
                     .await;
 
