@@ -230,16 +230,18 @@ impl ChunkInfo {
         retry_num: u32,
         cdn_url_suffix_list: &[String],
         cdn_health: &CdnHealth,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, Error> {
         let url_list_len = cdn_url_list.len();
         if url_list_len == 0 || url_list_len != cdn_url_suffix_list.len() {
-            eprintln!("Invalid CDN URL/suffix configuration.");
-            return vec![];
+            return Err(Error::Message(
+                "Invalid CDN URL/suffix configuration.".to_string(),
+            ));
         }
 
         let mut index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
         let mut retry_count = 0;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
+        let mut last_error: Option<String> = None;
 
         loop {
             let url = format!(
@@ -250,21 +252,34 @@ impl ChunkInfo {
                 Ok(res) => match res.error_for_status() {
                     Ok(ok_res) => match ok_res.bytes().await {
                         Ok(body_data) => {
-                            if body_data.len() != 0 {
+                            if !body_data.is_empty() {
                                 cdn_health.mark_success(index);
-                                return body_data.to_vec();
+                                return Ok(body_data.to_vec());
+                            }
+                            if last_error.is_none() {
+                                last_error = Some(format!("empty response body from {url}"));
                             }
                             cdn_health.mark_failure(index);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if last_error.is_none() {
+                                last_error =
+                                    Some(format!("failed to read response body from {url}: {e}"));
+                            }
                             cdn_health.mark_failure(index);
                         }
                     },
-                    Err(_) => {
+                    Err(e) => {
+                        if last_error.is_none() {
+                            last_error = Some(format!("http status error from {url}: {e}"));
+                        }
                         cdn_health.mark_failure(index);
                     }
                 },
-                Err(_) => {
+                Err(e) => {
+                    if last_error.is_none() {
+                        last_error = Some(format!("request error for {url}: {e}"));
+                    }
                     cdn_health.mark_failure(index);
                 }
             }
@@ -275,8 +290,12 @@ impl ChunkInfo {
                 backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
                 index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
             } else {
-                eprintln!("Max retries reached. Aborting.");
-                return vec![];
+                return Err(Error::Message(format!(
+                    "Failed to download chunk {} after {} attempts: {}",
+                    self.content_sha,
+                    retry_num,
+                    last_error.unwrap_or_else(|| "unknown error".to_string())
+                )));
             }
         }
     }
@@ -658,13 +677,9 @@ async fn main() -> Result<(), Error> {
                         cdn_url_suffix_list_for_task.as_ref(),
                         cdn_health_for_task.as_ref(),
                     )
-                    .await;
+                    .await?;
 
                 pb_for_closure.inc(data.len() as u64);
-
-                if data.len() == 0 {
-                    return Ok::<(), Error>(());
-                }
 
                 let depot_key_for_spawn = depot_key_for_task;
                 let original_size = chunk_info.original_size;
