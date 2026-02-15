@@ -30,7 +30,32 @@ use tokio::{
     task::spawn_blocking,
     time::{Duration, sleep},
 };
-type Error = Box<dyn std::error::Error>;
+
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Protobuf(#[from] protobuf::Error),
+    #[error(transparent)]
+    Decode(#[from] data_encoding::DecodeError),
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
+    #[error(transparent)]
+    IndicatifTemplate(#[from] indicatif::style::TemplateError),
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+    #[error("{0}")]
+    Message(String),
+}
+
+type Error = AppError;
 #[cfg(windows)]
 const INVALID_CHARS: &[char] = &['/', ':', '*', '?', '"', '<', '>', '|'];
 #[cfg(not(windows))]
@@ -205,12 +230,12 @@ struct Manifest {
     manifest_content: Vec<u8>,
 }
 impl Manifest {
-    pub fn new(manifest_path: &str) -> Self {
-        let file = std::fs::File::open(manifest_path).unwrap();
+    pub fn new(manifest_path: &str) -> Result<Self, Error> {
+        let file = std::fs::File::open(manifest_path)?;
         let mut bufreader = BufReader::new(file);
         let mut manifest_content = Vec::new();
-        let _ = bufreader.read_to_end(&mut manifest_content);
-        Manifest { manifest_content }
+        bufreader.read_to_end(&mut manifest_content)?;
+        Ok(Manifest { manifest_content })
     }
 
     pub fn deserialize_manifest(
@@ -218,17 +243,17 @@ impl Manifest {
     ) -> Result<(ContentManifestPayload, ContentManifestMetadata), Error> {
         let mut cursor = Cursor::new(&self.manifest_content);
         let mut payload_length = [0u8; 4];
-        let _ = std::io::Cursor::seek(&mut cursor, SeekFrom::Start(4));
-        let _ = cursor.read_exact(&mut payload_length);
+        std::io::Cursor::seek(&mut cursor, SeekFrom::Start(4))?;
+        cursor.read_exact(&mut payload_length)?;
         let payload_length = u32::from_le_bytes(payload_length);
         let mut payload = vec![0u8; payload_length as usize];
-        let _ = cursor.read_exact(&mut payload);
-        let _ = std::io::Cursor::seek(&mut cursor, SeekFrom::Current(4));
+        cursor.read_exact(&mut payload)?;
+        std::io::Cursor::seek(&mut cursor, SeekFrom::Current(4))?;
         let mut metadata_length = [0u8; 4];
-        let _ = cursor.read_exact(&mut metadata_length);
+        cursor.read_exact(&mut metadata_length)?;
         let metadata_length = u32::from_le_bytes(metadata_length);
         let mut metadata = vec![0u8; metadata_length as usize];
-        let _ = cursor.read_exact(&mut metadata);
+        cursor.read_exact(&mut metadata)?;
         let payload = ContentManifestPayload::parse_from_bytes(&payload)?;
         let metadata = ContentManifestMetadata::parse_from_bytes(&metadata)?;
         Ok((payload, metadata))
@@ -259,7 +284,8 @@ impl Decrypt {
 
     fn ecb_decrypt(&self, iv: &[u8]) -> Result<Vec<u8>, Error> {
         let mut block = GenericArray::from_slice(iv).to_owned();
-        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&self.key)?;
+        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&self.key)
+            .map_err(|e| Error::Message(format!("Invalid key length: {e:?}")))?;
         cipher.decrypt_block_mut(&mut block);
         let data = block.to_vec();
         Ok(data)
@@ -267,10 +293,10 @@ impl Decrypt {
 
     fn cbc_decrypt(&self, mut data: Vec<u8>) -> Result<Vec<u8>, Error> {
         let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
-            .map_err(|e| format!("Invalid key or IV: {:?}", e))?;
+            .map_err(|e| Error::Message(format!("Invalid key or IV: {e:?}")))?;
         let decrypted_data = cipher
             .decrypt_padded_mut::<Pkcs7>(&mut data)
-            .map_err(|e| format!("Unpadding error: {:?}", e))?;
+            .map_err(|e| Error::Message(format!("Unpadding error: {e:?}")))?;
         Ok(decrypted_data.to_vec())
     }
 
@@ -312,11 +338,11 @@ async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
     let url =
         "https://api.steampowered.com/icontentserverdirectoryservice/getserversforsteampipe/v1";
     let response = client.get(url).send().await?;
-    let text = &response.text().await?;
+    let text = response.text().await?;
     let json_data: Value = serde_json::from_str(&text)?;
     let servers = json_data["response"]["servers"]
         .as_array()
-        .ok_or("servers not found")?;
+        .ok_or_else(|| Error::Message("servers not found".to_string()))?;
 
     let mut url_list = Vec::new();
     for server in servers {
@@ -393,13 +419,20 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
 
         let mut filter = Filters::new();
-        filter.lzma1_properties(&compressed_data[7..12])?;
-        Stream::new_raw_decoder(&filter)?.process_vec(raw_data, &mut decrypted_data, Run)?;
+        filter
+            .lzma1_properties(&compressed_data[7..12])
+            .map_err(|e| Error::Message(format!("LZMA properties error: {e:?}")))?;
+        Stream::new_raw_decoder(&filter)
+            .map_err(|e| Error::Message(format!("LZMA decoder init error: {e:?}")))?
+            .process_vec(raw_data, &mut decrypted_data, Run)
+            .map_err(|e| Error::Message(format!("LZMA decode error: {e:?}")))?;
 
         if crc == crc32fast::hash(&decrypted_data) {
             return Ok(decrypted_data);
         } else {
-            return Err("decompressed lzma data CRC mismatch".into());
+            return Err(Error::Message(
+                "decompressed lzma data CRC mismatch".to_string(),
+            ));
         }
     } else if header == MAGIC_ZSTD {
         let raw_data = &compressed_data[8..compressed_data_len - 15];
@@ -416,7 +449,9 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         if crc == crc32fast::hash(&decrypted_data) {
             return Ok(decrypted_data);
         } else {
-            return Err("decompressed zstd data CRC mismatch".into());
+            return Err(Error::Message(
+                "decompressed zstd data CRC mismatch".to_string(),
+            ));
         }
     } else if header == MAGIC_ZIP {
         let raw_data = Cursor::new(&compressed_data);
@@ -433,10 +468,12 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         if crc == crc32fast::hash(&decrypted_data) {
             return Ok(decrypted_data);
         } else {
-            return Err("decompressed zip data CRC mismatch".into());
+            return Err(Error::Message(
+                "decompressed zip data CRC mismatch".to_string(),
+            ));
         }
     } else {
-        Err("Unknown file format detected".into())
+        Err(Error::Message("Unknown file format detected".to_string()))
     }
 }
 
@@ -453,7 +490,7 @@ async fn main() -> Result<(), Error> {
             .collect::<HashSet<_>>()
     });
 
-    let manifest = Manifest::new(manifest_path);
+    let manifest = Manifest::new(manifest_path)?;
     let (payload, metadata) = Manifest::deserialize_manifest(&manifest)?;
 
     let client = set_client(proxy_url)?;
@@ -536,7 +573,7 @@ async fn main() -> Result<(), Error> {
     let cdn_url_list_for_closure = Arc::clone(&cdn_url_list);
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
-    stream::iter(all_chunks)
+    let chunk_results = stream::iter(all_chunks)
         .map(|chunk_info| {
             let depot_key_for_task = depot_key_for_closure.clone();
             let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
@@ -552,46 +589,43 @@ async fn main() -> Result<(), Error> {
                     .await;
 
                 if data.len() == 0 {
-                    return;
+                    return Ok::<(), Error>(());
                 }
 
                 let depot_key_for_spawn = depot_key_for_task;
+                let original_size = chunk_info.original_size;
 
-                let decrypted_data = spawn_blocking(move || {
+                let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
                     let mut decrypt = Decrypt::new(data);
                     decrypt.set_key(depot_key_for_spawn);
-                    let decrypted_data = decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
+                    let decrypted_data = decrypt.decrypt_chunk()?;
+                    let data = decompress(decrypted_data)?;
 
-                    match decompress(decrypted_data) {
-                        Ok(data) => {
-                            if data.len() == chunk_info.original_size as usize {
-                                Ok(data)
-                            } else {
-                                Err(format!(
-                                    "Size mismatch: expected {} got {}",
-                                    chunk_info.original_size,
-                                    data.len()
-                                ))
-                            }
-                        }
-                        Err(e) => Err(format!("Failed to decompress chunk: {:?}", e)),
+                    if data.len() == original_size as usize {
+                        Ok(data)
+                    } else {
+                        Err(Error::Message(format!(
+                            "Size mismatch: expected {} got {}",
+                            original_size,
+                            data.len()
+                        )))
                     }
                 })
-                .await
-                .unwrap()
-                .expect("Failed to process chunk");
+                .await??;
 
-                chunk_info
-                    .write_chunk_into_file(decrypted_data)
-                    .await
-                    .expect("Failed to write chunk into file");
+                chunk_info.write_chunk_into_file(decrypted_data).await?;
 
-                pb_for_closure.inc(chunk_info.original_size.into());
+                pb_for_closure.inc(original_size.into());
+                Ok::<(), Error>(())
             }
         })
         .buffer_unordered(cpu_num * 4)
         .collect::<Vec<_>>()
         .await;
+
+    for result in chunk_results {
+        result?;
+    }
 
     Ok(())
 }
