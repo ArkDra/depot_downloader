@@ -255,17 +255,15 @@ impl Decrypt {
     }
 
     fn ecb_decrypt(&self, iv: &[u8]) -> Result<Vec<u8>, Error> {
-        let key = HEXLOWER.decode(&self.key)?;
         let mut block = GenericArray::from_slice(iv).to_owned();
-        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&key)?;
+        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&self.key)?;
         cipher.decrypt_block_mut(&mut block);
         let data = block.to_vec();
         Ok(data)
     }
 
     fn cbc_decrypt(&self, mut data: Vec<u8>) -> Result<Vec<u8>, Error> {
-        let key = HEXLOWER.decode(&self.key)?;
-        let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&key, &self.iv)
+        let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
             .map_err(|e| format!("Invalid key or IV: {:?}", e))?;
         let decrypted_data = cipher
             .decrypt_padded_mut::<Pkcs7>(&mut data)
@@ -444,6 +442,7 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let (manifest_path, depot_key, output_path, proxy_url, retry_num, cdn_pairs, file_names) =
         args.get_args();
+    let decoded_depot_key = HEXLOWER.decode(depot_key.as_bytes())?;
     let normalized_file_names = file_names.map(|names| {
         names
             .iter()
@@ -472,10 +471,9 @@ async fn main() -> Result<(), Error> {
     for file in payload.mappings {
         if file.flags == 0 {
             let file_name = if metadata.filenames_encrypted {
-                let depot_key_clone = depot_key.to_owned().into_bytes();
                 let decoded_file_name = BASE64_MIME.decode(file.filename.as_bytes())?;
                 let mut decrypt = Decrypt::new(decoded_file_name);
-                decrypt.set_key(depot_key_clone);
+                decrypt.set_key(decoded_depot_key.clone());
                 decrypt.decrypt_file_name()?
             } else {
                 file.filename
@@ -526,59 +524,62 @@ async fn main() -> Result<(), Error> {
         .progress_chars("#>-"),
     );
 
-    let depot_key_for_closure = depot_key;
+    let depot_key_for_closure = decoded_depot_key;
     let client_for_closure = &client;
     let cdn_url_suffix_list_for_closure = &cdn_url_suffix_list;
     let cdn_url_list_for_closure = &cdn_url_list;
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
     stream::iter(all_chunks)
-        .map(|chunk_info| async move {
-            let data = chunk_info
-                .get_chunk(
-                    cdn_url_list_for_closure.to_owned(),
-                    &client_for_closure,
-                    retry_num,
-                    cdn_url_suffix_list_for_closure.to_owned(),
-                )
-                .await;
+        .map(|chunk_info| {
+            let depot_key_for_task = depot_key_for_closure.clone();
+            async move {
+                let data = chunk_info
+                    .get_chunk(
+                        cdn_url_list_for_closure.to_owned(),
+                        &client_for_closure,
+                        retry_num,
+                        cdn_url_suffix_list_for_closure.to_owned(),
+                    )
+                    .await;
 
-            if data.len() == 0 {
-                return;
-            }
-
-            let depot_key_for_spawn = depot_key_for_closure.to_owned();
-
-            let decrypted_data = spawn_blocking(move || {
-                let mut decrypt = Decrypt::new(data);
-                decrypt.set_key(depot_key_for_spawn.into_bytes());
-                let decrypted_data = decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
-
-                match decompress(decrypted_data) {
-                    Ok(data) => {
-                        if data.len() == chunk_info.original_size as usize {
-                            Ok(data)
-                        } else {
-                            Err(format!(
-                                "Size mismatch: expected {} got {}",
-                                chunk_info.original_size,
-                                data.len()
-                            ))
-                        }
-                    }
-                    Err(e) => Err(format!("Failed to decompress chunk: {:?}", e)),
+                if data.len() == 0 {
+                    return;
                 }
-            })
-            .await
-            .unwrap()
-            .expect("Failed to process chunk");
 
-            chunk_info
-                .write_chunk_into_file(decrypted_data)
+                let depot_key_for_spawn = depot_key_for_task;
+
+                let decrypted_data = spawn_blocking(move || {
+                    let mut decrypt = Decrypt::new(data);
+                    decrypt.set_key(depot_key_for_spawn);
+                    let decrypted_data = decrypt.decrypt_chunk().expect("Failed to decrypt chunk");
+
+                    match decompress(decrypted_data) {
+                        Ok(data) => {
+                            if data.len() == chunk_info.original_size as usize {
+                                Ok(data)
+                            } else {
+                                Err(format!(
+                                    "Size mismatch: expected {} got {}",
+                                    chunk_info.original_size,
+                                    data.len()
+                                ))
+                            }
+                        }
+                        Err(e) => Err(format!("Failed to decompress chunk: {:?}", e)),
+                    }
+                })
                 .await
-                .expect("Failed to write chunk into file");
+                .unwrap()
+                .expect("Failed to process chunk");
 
-            pb_for_closure.inc(chunk_info.original_size.into());
+                chunk_info
+                    .write_chunk_into_file(decrypted_data)
+                    .await
+                    .expect("Failed to write chunk into file");
+
+                pb_for_closure.inc(chunk_info.original_size.into());
+            }
         })
         .buffer_unordered(cpu_num * 4)
         .collect::<Vec<_>>()
