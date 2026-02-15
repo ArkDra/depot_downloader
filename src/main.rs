@@ -577,7 +577,7 @@ async fn main() -> Result<(), Error> {
 
     let cpu_num = num_cpus::get();
     let mut all_chunks = Vec::new();
-    let mut total_download_size = 0;
+    let mut estimated_download_bytes = 0;
     // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
         if file.flags == 0 {
@@ -609,11 +609,12 @@ async fn main() -> Result<(), Error> {
                 continue;
             }
 
-            total_download_size += file.size;
-
             let mut file_chunks = Vec::with_capacity(file.chunks.len());
             // Step 2: Extract all chunk information
             for chunk in file.chunks {
+                if chunk.cb_compressed != 0 {
+                    estimated_download_bytes += chunk.cb_compressed as u64;
+                }
                 let chunk_info = ChunkInfo::new(
                     chunk.offset,
                     chunk.cb_original,
@@ -628,12 +629,11 @@ async fn main() -> Result<(), Error> {
         }
     }
 
-    let pb = ProgressBar::new(total_download_size).with_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-        )?
-        .progress_chars("#>-"),
-    );
+    let progress_style = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar}] {decimal_bytes}/{decimal_total_bytes} ({decimal_bytes_per_sec}, {eta})",
+    )?
+    .progress_chars("#>-");
+    let pb = ProgressBar::new(estimated_download_bytes).with_style(progress_style);
 
     let depot_key_for_closure = decoded_depot_key;
     let retry_num = config.retry_num;
@@ -659,6 +659,8 @@ async fn main() -> Result<(), Error> {
                         cdn_health_for_task.as_ref(),
                     )
                     .await;
+
+                pb_for_closure.inc(data.len() as u64);
 
                 if data.len() == 0 {
                     return Ok::<(), Error>(());
@@ -686,8 +688,6 @@ async fn main() -> Result<(), Error> {
                 .await??;
 
                 chunk_info.write_chunk_into_file(decrypted_data).await?;
-
-                pb_for_closure.inc(original_size.into());
                 Ok::<(), Error>(())
             }
         })
