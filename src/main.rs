@@ -347,52 +347,42 @@ impl Manifest {
     }
 }
 
-struct Decrypt {
-    key: Vec<u8>,
+struct Decrypt<'a> {
+    key: &'a [u8],
     encrypted_data: Vec<u8>,
-    iv: Vec<u8>,
 }
-impl Decrypt {
-    pub fn new(encrypted_data: Vec<u8>) -> Self {
+impl<'a> Decrypt<'a> {
+    pub fn new(encrypted_data: Vec<u8>, key: &'a [u8]) -> Self {
         Decrypt {
-            key: vec![],
+            key,
             encrypted_data,
-            iv: vec![],
         }
     }
 
-    pub fn set_key(&mut self, key: Vec<u8>) {
-        self.key = key
-    }
-
-    fn set_iv(&mut self, iv: Vec<u8>) {
-        self.iv = iv
-    }
-
-    fn ecb_decrypt(&self, iv: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut block = GenericArray::from_slice(iv).to_owned();
-        let mut cipher = ecb::Decryptor::<Aes256>::new_from_slice(&self.key)
-            .map_err(|e| Error::Message(format!("Invalid key length: {e:?}")))?;
-        cipher.decrypt_block_mut(&mut block);
-        let data = block.to_vec();
-        Ok(data)
-    }
-
-    fn cbc_decrypt(&self, mut data: Vec<u8>) -> Result<Vec<u8>, Error> {
-        let cipher = cbc::Decryptor::<Aes256>::new_from_slices(&self.key, &self.iv)
-            .map_err(|e| Error::Message(format!("Invalid key or IV: {e:?}")))?;
-        let decrypted_data = cipher
-            .decrypt_padded_mut::<Pkcs7>(&mut data)
-            .map_err(|e| Error::Message(format!("Unpadding error: {e:?}")))?;
-        Ok(decrypted_data.to_vec())
-    }
-
     pub fn decrypt_chunk(&mut self) -> Result<Vec<u8>, Error> {
-        let decrypted_iv = self.ecb_decrypt(&self.encrypted_data[..16])?;
-        self.set_iv(decrypted_iv);
-        let data = self.encrypted_data[16..].to_vec();
-        let decrypted_data = self.cbc_decrypt(data)?;
-        Ok(decrypted_data)
+        if self.encrypted_data.len() < 16 {
+            return Err(Error::Message("Encrypted chunk is too short".to_string()));
+        }
+
+        let mut iv_block = GenericArray::clone_from_slice(&self.encrypted_data[..16]);
+        let mut ecb_cipher = ecb::Decryptor::<Aes256>::new_from_slice(self.key)
+            .map_err(|e| Error::Message(format!("Invalid key length: {e:?}")))?;
+        ecb_cipher.decrypt_block_mut(&mut iv_block);
+
+        let cbc_cipher = cbc::Decryptor::<Aes256>::new_from_slices(self.key, iv_block.as_slice())
+            .map_err(|e| Error::Message(format!("Invalid key or IV: {e:?}")))?;
+
+        let decrypted_len = {
+            let encrypted_payload = &mut self.encrypted_data[16..];
+            let decrypted_slice = cbc_cipher
+                .decrypt_padded_mut::<Pkcs7>(encrypted_payload)
+                .map_err(|e| Error::Message(format!("Unpadding error: {e:?}")))?;
+            decrypted_slice.len()
+        };
+
+        self.encrypted_data.copy_within(16..16 + decrypted_len, 0);
+        self.encrypted_data.truncate(decrypted_len);
+        Ok(std::mem::take(&mut self.encrypted_data))
     }
 
     pub fn decrypt_file_name(&mut self) -> Result<String, Error> {
@@ -567,7 +557,7 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let config = args.get_args();
-    let decoded_depot_key = HEXLOWER.decode(config.depot_key.as_bytes())?;
+    let decoded_depot_key: Arc<[u8]> = HEXLOWER.decode(config.depot_key.as_bytes())?.into();
     let normalized_file_names = config.file_names.map(|names| {
         names
             .iter()
@@ -601,8 +591,7 @@ async fn main() -> Result<(), Error> {
         if file.flags == 0 {
             let file_name = if metadata.filenames_encrypted {
                 let decoded_file_name = BASE64_MIME.decode(file.filename.as_bytes())?;
-                let mut decrypt = Decrypt::new(decoded_file_name);
-                decrypt.set_key(decoded_depot_key.clone());
+                let mut decrypt = Decrypt::new(decoded_file_name, decoded_depot_key.as_ref());
                 decrypt.decrypt_file_name()?
             } else {
                 file.filename
@@ -684,8 +673,7 @@ async fn main() -> Result<(), Error> {
                 let original_size = chunk_info.original_size;
 
                 let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
-                    let mut decrypt = Decrypt::new(data);
-                    decrypt.set_key(depot_key_for_spawn);
+                    let mut decrypt = Decrypt::new(data, depot_key_for_spawn.as_ref());
                     let decrypted_data = decrypt.decrypt_chunk()?;
                     let data = decompress(decrypted_data)?;
 
