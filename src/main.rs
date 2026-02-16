@@ -27,7 +27,8 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    task::spawn_blocking,
+    sync::mpsc,
+    task::{JoinSet, spawn_blocking},
     time::{Duration, sleep},
 };
 
@@ -155,6 +156,11 @@ struct ChunkInfo {
     depot_id: u32,
     file_path: PathBuf,
     content_sha: String,
+}
+
+struct DownloadedChunk {
+    chunk_info: ChunkInfo,
+    data: Vec<u8>,
 }
 
 struct CdnHealth {
@@ -425,7 +431,8 @@ async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
     for server in servers {
         if server["weighted_load"].as_i64() <= Some(130)
             && let Some(host) = server["host"].as_str()
-            && host.contains("steamcontent.com") && host.contains("steampipe")
+            && host.contains("steamcontent.com")
+            && host.contains("steampipe")
         {
             url_list.push(host.to_string());
         }
@@ -583,6 +590,95 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
     }
 }
 
+async fn download_chunks(
+    all_chunks: Vec<ChunkInfo>,
+    download_concurrency: usize,
+    cdn_url_list: Arc<[String]>,
+    cdn_url_suffix_list: Arc<[String]>,
+    client: &Client,
+    retry_num: u32,
+    cdn_health: Arc<CdnHealth>,
+    pb: &ProgressBar,
+    tx: mpsc::Sender<DownloadedChunk>,
+) -> Result<(), Error> {
+    stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
+        .try_for_each_concurrent(download_concurrency, |chunk_info| {
+            let cdn_url_list_for_task = Arc::clone(&cdn_url_list);
+            let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list);
+            let cdn_health_for_task = Arc::clone(&cdn_health);
+            let tx_for_task = tx.clone();
+            async move {
+                let data = chunk_info
+                    .get_chunk(
+                        cdn_url_list_for_task.as_ref(),
+                        client,
+                        retry_num,
+                        cdn_url_suffix_list_for_task.as_ref(),
+                        cdn_health_for_task.as_ref(),
+                    )
+                    .await?;
+                pb.inc(data.len() as u64);
+                tx_for_task
+                    .send(DownloadedChunk { chunk_info, data })
+                    .await
+                    .map_err(|_| {
+                        Error::Message(
+                            "Decode stage terminated before all downloads finished".to_string(),
+                        )
+                    })?;
+                Ok::<(), Error>(())
+            }
+        })
+        .await
+}
+
+async fn decode_and_write_chunks(
+    mut rx: mpsc::Receiver<DownloadedChunk>,
+    decode_concurrency: usize,
+    depot_key: Arc<[u8]>,
+) -> Result<(), Error> {
+    let mut decode_tasks = JoinSet::new();
+    while let Some(downloaded_chunk) = rx.recv().await {
+        while decode_tasks.len() >= decode_concurrency {
+            if let Some(join_result) = decode_tasks.join_next().await {
+                join_result??;
+            }
+        }
+
+        let depot_key_for_task = Arc::clone(&depot_key);
+        decode_tasks.spawn(async move {
+            let DownloadedChunk { chunk_info, data } = downloaded_chunk;
+            let original_size = chunk_info.original_size;
+
+            let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
+                let mut decrypt = Decrypt::new(data, depot_key_for_task.as_ref());
+                let decrypted_data = decrypt.decrypt_chunk()?;
+                let mut output = Vec::with_capacity(original_size as usize);
+                decompress_into(&decrypted_data, &mut output)?;
+
+                if output.len() == original_size as usize {
+                    Ok(output)
+                } else {
+                    Err(Error::Message(format!(
+                        "Size mismatch: expected {} got {}",
+                        original_size,
+                        output.len()
+                    )))
+                }
+            })
+            .await??;
+
+            chunk_info.write_chunk_into_file(decrypted_data).await
+        });
+    }
+
+    while let Some(join_result) = decode_tasks.join_next().await {
+        join_result??;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
@@ -614,7 +710,9 @@ async fn main() -> Result<(), Error> {
     };
 
     let cpu_num = num_cpus::get();
-    let decode_concurrency = (cpu_num * 4).max(1);
+    let download_concurrency = (cpu_num * 4).max(1);
+    let decode_concurrency = cpu_num.max(1);
+    let decode_queue_capacity = (decode_concurrency * 2).max(1);
     let mut all_chunks = Vec::new();
     let mut estimated_download_bytes = 0;
     // Step 1: Preprocess all files to be downloaded
@@ -673,58 +771,24 @@ async fn main() -> Result<(), Error> {
     .progress_chars("#>-");
     let pb = ProgressBar::new(estimated_download_bytes).with_style(progress_style);
 
-    let depot_key_for_closure = decoded_depot_key;
-    let retry_num = config.retry_num;
-    let client_for_closure = &client;
-    let cdn_url_suffix_list_for_closure = Arc::clone(&cdn_url_suffix_list);
-    let cdn_url_list_for_closure = Arc::clone(&cdn_url_list);
-    let cdn_health_for_closure = Arc::new(CdnHealth::new(cdn_url_list_for_closure.len()));
-    let pb_for_closure = &pb;
-    // Step 3: download and process all chunks
-    stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
-        .try_for_each_concurrent(decode_concurrency, |chunk_info| {
-            let depot_key_for_task = depot_key_for_closure.clone();
-            let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
-            let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list_for_closure);
-            let cdn_health_for_task = Arc::clone(&cdn_health_for_closure);
-            async move {
-                let data = chunk_info
-                    .get_chunk(
-                        cdn_url_list_for_task.as_ref(),
-                        client_for_closure,
-                        retry_num,
-                        cdn_url_suffix_list_for_task.as_ref(),
-                        cdn_health_for_task.as_ref(),
-                    )
-                    .await?;
+    // Step 3: split into download stage and decode/write stage with bounded backpressure
+    let (tx, rx) = mpsc::channel(decode_queue_capacity);
+    let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
 
-                pb_for_closure.inc(data.len() as u64);
-
-                let depot_key_for_spawn = depot_key_for_task;
-                let original_size = chunk_info.original_size;
-
-                let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
-                    let mut decrypt = Decrypt::new(data, depot_key_for_spawn.as_ref());
-                    let decrypted_data = decrypt.decrypt_chunk()?;
-                    let mut output = Vec::with_capacity(original_size as usize);
-                    decompress_into(&decrypted_data, &mut output)?;
-
-                    if output.len() == original_size as usize {
-                        Ok(output)
-                    } else {
-                        Err(Error::Message(format!(
-                            "Size mismatch: expected {} got {}",
-                            original_size,
-                            output.len()
-                        )))
-                    }
-                })
-                .await??;
-                chunk_info.write_chunk_into_file(decrypted_data).await?;
-                Ok::<(), Error>(())
-            }
-        })
-        .await?;
+    tokio::try_join!(
+        download_chunks(
+            all_chunks,
+            download_concurrency,
+            Arc::clone(&cdn_url_list),
+            Arc::clone(&cdn_url_suffix_list),
+            &client,
+            config.retry_num,
+            Arc::clone(&cdn_health),
+            &pb,
+            tx,
+        ),
+        decode_and_write_chunks(rx, decode_concurrency, decoded_depot_key),
+    )?;
 
     Ok(())
 }
