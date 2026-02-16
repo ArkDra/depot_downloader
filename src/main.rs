@@ -120,7 +120,7 @@ impl Args {
                         cdn_url
                             .iter()
                             .cloned()
-                            .zip(std::iter::repeat("".to_string()).take(cdn_url.len()))
+                            .zip(std::iter::repeat_n("".to_string(), cdn_url.len()))
                             .collect(),
                     )
                 }
@@ -433,12 +433,11 @@ async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
 
     let mut url_list = Vec::new();
     for server in servers {
-        if server["weighted_load"].as_i64() <= Some(130) {
-            if let Some(host) = server["host"].as_str() {
-                if host.contains("steamcontent.com") {
-                    url_list.push(host.to_string());
-                }
-            }
+        if server["weighted_load"].as_i64() <= Some(130)
+            && let Some(host) = server["host"].as_str()
+            && host.contains("steamcontent.com")
+        {
+            url_list.push(host.to_string());
         }
     }
     Ok(url_list)
@@ -479,10 +478,10 @@ fn prepare_output_file(
             return Ok((true, path));
         }
     } else {
-        if let Some(parent_dir) = path.parent() {
-            if !parent_dir.exists() {
-                fs::create_dir_all(parent_dir)?;
-            }
+        if let Some(parent_dir) = path.parent()
+            && !parent_dir.exists()
+        {
+            fs::create_dir_all(parent_dir)?;
         }
         let file = File::create(&path)?;
         file.set_len(file_size)?
@@ -515,11 +514,11 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
             .map_err(|e| Error::Message(format!("LZMA decode error: {e:?}")))?;
 
         if crc == crc32fast::hash(&decrypted_data) {
-            return Ok(decrypted_data);
+            Ok(decrypted_data)
         } else {
-            return Err(Error::Message(
+            Err(Error::Message(
                 "decompressed lzma data CRC mismatch".to_string(),
-            ));
+            ))
         }
     } else if header == MAGIC_ZSTD {
         let raw_data = &compressed_data[8..compressed_data_len - 15];
@@ -534,11 +533,11 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         zstd::stream::copy_decode(raw_data, &mut decrypted_data)?;
 
         if crc == crc32fast::hash(&decrypted_data) {
-            return Ok(decrypted_data);
+            Ok(decrypted_data)
         } else {
-            return Err(Error::Message(
+            Err(Error::Message(
                 "decompressed zstd data CRC mismatch".to_string(),
-            ));
+            ))
         }
     } else if header == MAGIC_ZIP {
         let raw_data = Cursor::new(&compressed_data);
@@ -553,11 +552,11 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
         file.read_to_end(&mut decrypted_data)?;
 
         if crc == crc32fast::hash(&decrypted_data) {
-            return Ok(decrypted_data);
+            Ok(decrypted_data)
         } else {
-            return Err(Error::Message(
+            Err(Error::Message(
                 "decompressed zip data CRC mismatch".to_string(),
-            ));
+            ))
         }
     } else {
         Err(Error::Message("Unknown file format detected".to_string()))
