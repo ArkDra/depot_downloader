@@ -479,20 +479,40 @@ fn prepare_output_file(
     Ok((false, path))
 }
 
-fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
-    let mut header = [0u8; 4];
-    let data_header = &compressed_data[..4];
-    header.clone_from_slice(data_header);
-    let compressed_data_len = compressed_data.len();
-    if header[..3] == MAGIC_LZMA {
-        let raw_data = &compressed_data[12..compressed_data_len - 10];
+fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), Error> {
+    if compressed_data.len() < 4 {
+        return Err(Error::Message(
+            "Compressed chunk is too short for header".to_string(),
+        ));
+    }
 
-        let decrypted_size_bytes =
-            &compressed_data[compressed_data_len - 6..compressed_data_len - 2];
-        let decrypted_size = u32::from_le_bytes(decrypted_size_bytes.try_into().unwrap());
-        let mut decrypted_data = Vec::with_capacity(decrypted_size as usize);
-        let crc_bytes = &compressed_data[compressed_data_len - 10..compressed_data_len - 6];
-        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    let mut header = [0u8; 4];
+    header.copy_from_slice(&compressed_data[..4]);
+    let compressed_data_len = compressed_data.len();
+    output.clear();
+
+    if header[..3] == MAGIC_LZMA {
+        if compressed_data_len < 22 {
+            return Err(Error::Message(
+                "Compressed LZMA chunk is too short".to_string(),
+            ));
+        }
+
+        let raw_data = &compressed_data[12..compressed_data_len - 10];
+        let decrypted_size = u32::from_le_bytes(
+            compressed_data[compressed_data_len - 6..compressed_data_len - 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let crc = u32::from_le_bytes(
+            compressed_data[compressed_data_len - 10..compressed_data_len - 6]
+                .try_into()
+                .unwrap(),
+        );
+
+        if output.capacity() < decrypted_size {
+            output.reserve(decrypted_size - output.len());
+        }
 
         let mut filter = Filters::new();
         filter
@@ -500,49 +520,59 @@ fn decompress(compressed_data: Vec<u8>) -> Result<Vec<u8>, Error> {
             .map_err(|e| Error::Message(format!("LZMA properties error: {e:?}")))?;
         Stream::new_raw_decoder(&filter)
             .map_err(|e| Error::Message(format!("LZMA decoder init error: {e:?}")))?
-            .process_vec(raw_data, &mut decrypted_data, Run)
+            .process_vec(raw_data, output, Run)
             .map_err(|e| Error::Message(format!("LZMA decode error: {e:?}")))?;
 
-        if crc == crc32fast::hash(&decrypted_data) {
-            Ok(decrypted_data)
+        if crc == crc32fast::hash(output) {
+            Ok(())
         } else {
             Err(Error::Message(
                 "decompressed lzma data CRC mismatch".to_string(),
             ))
         }
     } else if header == MAGIC_ZSTD {
+        if compressed_data_len < 23 {
+            return Err(Error::Message(
+                "Compressed zstd chunk is too short".to_string(),
+            ));
+        }
+
         let raw_data = &compressed_data[8..compressed_data_len - 15];
+        let decrypted_size = u32::from_le_bytes(
+            compressed_data[compressed_data_len - 11..compressed_data_len - 7]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let crc = u32::from_le_bytes(compressed_data[4..8].try_into().unwrap());
 
-        let decrypted_size_bytes =
-            &compressed_data[compressed_data_len - 11..compressed_data_len - 7];
-        let decrypted_size = u32::from_le_bytes(decrypted_size_bytes.try_into().unwrap());
-        let mut decrypted_data = Vec::with_capacity(decrypted_size as usize);
-        let crc_bytes = &compressed_data[4..8];
-        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        if output.capacity() < decrypted_size {
+            output.reserve(decrypted_size - output.len());
+        }
 
-        zstd::stream::copy_decode(raw_data, &mut decrypted_data)?;
+        zstd::stream::copy_decode(raw_data, &mut *output)?;
 
-        if crc == crc32fast::hash(&decrypted_data) {
-            Ok(decrypted_data)
+        if crc == crc32fast::hash(output) {
+            Ok(())
         } else {
             Err(Error::Message(
                 "decompressed zstd data CRC mismatch".to_string(),
             ))
         }
     } else if header == MAGIC_ZIP {
-        let raw_data = Cursor::new(&compressed_data);
+        let raw_data = Cursor::new(compressed_data);
 
         let mut archive = zip::ZipArchive::new(raw_data)?;
         let mut file = archive.by_index(0)?;
 
         let crc = file.crc32();
         let decrypted_size = file.size() as usize;
-        let mut decrypted_data = Vec::with_capacity(decrypted_size);
+        if output.capacity() < decrypted_size {
+            output.reserve(decrypted_size - output.len());
+        }
+        file.read_to_end(output)?;
 
-        file.read_to_end(&mut decrypted_data)?;
-
-        if crc == crc32fast::hash(&decrypted_data) {
-            Ok(decrypted_data)
+        if crc == crc32fast::hash(output) {
+            Ok(())
         } else {
             Err(Error::Message(
                 "decompressed zip data CRC mismatch".to_string(),
@@ -584,6 +614,7 @@ async fn main() -> Result<(), Error> {
     };
 
     let cpu_num = num_cpus::get();
+    let decode_concurrency = (cpu_num * 4).max(1);
     let mut all_chunks = Vec::new();
     let mut estimated_download_bytes = 0;
     // Step 1: Preprocess all files to be downloaded
@@ -651,7 +682,7 @@ async fn main() -> Result<(), Error> {
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
     stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
-        .try_for_each_concurrent(cpu_num * 4, |chunk_info| {
+        .try_for_each_concurrent(decode_concurrency, |chunk_info| {
             let depot_key_for_task = depot_key_for_closure.clone();
             let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
             let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list_for_closure);
@@ -675,20 +706,20 @@ async fn main() -> Result<(), Error> {
                 let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
                     let mut decrypt = Decrypt::new(data, depot_key_for_spawn.as_ref());
                     let decrypted_data = decrypt.decrypt_chunk()?;
-                    let data = decompress(decrypted_data)?;
+                    let mut output = Vec::with_capacity(original_size as usize);
+                    decompress_into(&decrypted_data, &mut output)?;
 
-                    if data.len() == original_size as usize {
-                        Ok(data)
+                    if output.len() == original_size as usize {
+                        Ok(output)
                     } else {
                         Err(Error::Message(format!(
                             "Size mismatch: expected {} got {}",
                             original_size,
-                            data.len()
+                            output.len()
                         )))
                     }
                 })
                 .await??;
-
                 chunk_info.write_chunk_into_file(decrypted_data).await?;
                 Ok::<(), Error>(())
             }
