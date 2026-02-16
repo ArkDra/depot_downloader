@@ -8,7 +8,7 @@ use aes::{
 };
 use clap::{Parser, Subcommand};
 use data_encoding::{BASE64_MIME, HEXLOWER};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use liblzma::stream::{Action::Run, Filters, Stream};
 use protobuf::Message;
@@ -435,7 +435,7 @@ async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
     for server in servers {
         if server["weighted_load"].as_i64() <= Some(130)
             && let Some(host) = server["host"].as_str()
-            && host.contains("steamcontent.com")
+            && host.contains("steamcontent.com") && host.contains("steampipe")
         {
             url_list.push(host.to_string());
         }
@@ -661,8 +661,8 @@ async fn main() -> Result<(), Error> {
     let cdn_health_for_closure = Arc::new(CdnHealth::new(cdn_url_list_for_closure.len()));
     let pb_for_closure = &pb;
     // Step 3: download and process all chunks
-    let chunk_results = stream::iter(all_chunks)
-        .map(|chunk_info| {
+    stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
+        .try_for_each_concurrent(cpu_num * 4, |chunk_info| {
             let depot_key_for_task = depot_key_for_closure.clone();
             let cdn_url_list_for_task = Arc::clone(&cdn_url_list_for_closure);
             let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list_for_closure);
@@ -705,13 +705,7 @@ async fn main() -> Result<(), Error> {
                 Ok::<(), Error>(())
             }
         })
-        .buffer_unordered(cpu_num * 4)
-        .collect::<Vec<_>>()
-        .await;
-
-    for result in chunk_results {
-        result?;
-    }
+        .await?;
 
     Ok(())
 }
