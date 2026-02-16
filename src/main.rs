@@ -16,7 +16,7 @@ use reqwest::{Client, Proxy};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     task::{JoinSet, spawn_blocking},
     time::{Duration, sleep},
 };
@@ -161,6 +161,11 @@ struct ChunkInfo {
 struct DownloadedChunk {
     chunk_info: ChunkInfo,
     data: Vec<u8>,
+}
+
+struct FileHandleState {
+    file: tokio::fs::File,
+    remaining_chunks: usize,
 }
 
 struct CdnHealth {
@@ -304,18 +309,6 @@ impl ChunkInfo {
                 )));
             }
         }
-    }
-
-    pub async fn write_chunk_into_file(&self, decrypted_data: Vec<u8>) -> Result<(), Error> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.file_path)
-            .await?;
-        tokio::io::AsyncSeekExt::seek(&mut file, SeekFrom::Start(self.offset)).await?;
-        file.write_all(&decrypted_data).await?;
-        file.flush().await?;
-        Ok(())
     }
 }
 
@@ -590,6 +583,29 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
     }
 }
 
+async fn init_file_handles(
+    file_chunk_counts: &HashMap<PathBuf, usize>,
+) -> Result<HashMap<PathBuf, Arc<Mutex<FileHandleState>>>, Error> {
+    let mut file_handles = HashMap::with_capacity(file_chunk_counts.len());
+
+    for (path, chunk_count) in file_chunk_counts {
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await?;
+        file_handles.insert(
+            path.clone(),
+            Arc::new(Mutex::new(FileHandleState {
+                file,
+                remaining_chunks: *chunk_count,
+            })),
+        );
+    }
+
+    Ok(file_handles)
+}
+
 async fn download_chunks(
     all_chunks: Vec<ChunkInfo>,
     download_concurrency: usize,
@@ -636,6 +652,7 @@ async fn decode_and_write_chunks(
     mut rx: mpsc::Receiver<DownloadedChunk>,
     decode_concurrency: usize,
     depot_key: Arc<[u8]>,
+    file_handles: Arc<HashMap<PathBuf, Arc<Mutex<FileHandleState>>>>,
 ) -> Result<(), Error> {
     let mut decode_tasks = JoinSet::new();
     while let Some(downloaded_chunk) = rx.recv().await {
@@ -646,9 +663,19 @@ async fn decode_and_write_chunks(
         }
 
         let depot_key_for_task = Arc::clone(&depot_key);
+        let file_handles_for_task = Arc::clone(&file_handles);
         decode_tasks.spawn(async move {
             let DownloadedChunk { chunk_info, data } = downloaded_chunk;
             let original_size = chunk_info.original_size;
+            let file_handle = file_handles_for_task
+                .get(&chunk_info.file_path)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Message(format!(
+                        "Missing file handle for {}",
+                        chunk_info.file_path.display()
+                    ))
+                })?;
 
             let decrypted_data = spawn_blocking(move || -> Result<Vec<u8>, Error> {
                 let mut decrypt = Decrypt::new(data, depot_key_for_task.as_ref());
@@ -668,7 +695,22 @@ async fn decode_and_write_chunks(
             })
             .await??;
 
-            chunk_info.write_chunk_into_file(decrypted_data).await
+            let mut file_state = file_handle.lock().await;
+            tokio::io::AsyncSeekExt::seek(&mut file_state.file, SeekFrom::Start(chunk_info.offset))
+                .await?;
+            file_state.file.write_all(&decrypted_data).await?;
+            if file_state.remaining_chunks == 0 {
+                return Err(Error::Message(format!(
+                    "Unexpected extra chunk write for {}",
+                    chunk_info.file_path.display()
+                )));
+            }
+            file_state.remaining_chunks -= 1;
+            if file_state.remaining_chunks == 0 {
+                file_state.file.flush().await?;
+            }
+
+            Ok(())
         });
     }
 
@@ -714,6 +756,7 @@ async fn main() -> Result<(), Error> {
     let decode_concurrency = cpu_num.max(1);
     let decode_queue_capacity = (decode_concurrency * 2).max(1);
     let mut all_chunks = Vec::new();
+    let mut file_chunk_counts = HashMap::new();
     let mut estimated_download_bytes = 0;
     // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
@@ -745,6 +788,7 @@ async fn main() -> Result<(), Error> {
                 continue;
             }
 
+            let chunk_count = file.chunks.len();
             let mut file_chunks = Vec::with_capacity(file.chunks.len());
             // Step 2: Extract all chunk information
             for chunk in file.chunks {
@@ -762,6 +806,9 @@ async fn main() -> Result<(), Error> {
             }
 
             all_chunks.extend(file_chunks);
+            if chunk_count != 0 {
+                file_chunk_counts.insert(path, chunk_count);
+            }
         }
     }
 
@@ -774,6 +821,7 @@ async fn main() -> Result<(), Error> {
     // Step 3: split into download stage and decode/write stage with bounded backpressure
     let (tx, rx) = mpsc::channel(decode_queue_capacity);
     let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
+    let file_handles = Arc::new(init_file_handles(&file_chunk_counts).await?);
 
     tokio::try_join!(
         download_chunks(
@@ -787,7 +835,7 @@ async fn main() -> Result<(), Error> {
             &pb,
             tx,
         ),
-        decode_and_write_chunks(rx, decode_concurrency, decoded_depot_key),
+        decode_and_write_chunks(rx, decode_concurrency, decoded_depot_key, file_handles),
     )?;
 
     Ok(())
