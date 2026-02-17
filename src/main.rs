@@ -656,9 +656,11 @@ fn prepare_output_file(
         {
             fs::create_dir_all(parent_dir)?;
         }
-        let file = File::create(&path)?;
-        file.set_len(file_size)?
+        File::create(&path)?;
     }
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_len(0)?;
+    file.set_len(file_size)?;
     Ok((false, path))
 }
 
