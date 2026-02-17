@@ -110,9 +110,9 @@ impl Args {
                 cdn_url_suffix,
             }) => {
                 if let Some(cdn_url_suffix) = cdn_url_suffix {
-                    if cdn_url.len() != cdn_url_suffix.len() {
+                    if cdn_url_suffix.len() > cdn_url.len() {
                         return Err(Error::Message(
-                            "The number of cdn_url and cdn_url_suffix must be the same"
+                            "The number of cdn_url_suffix cannot be greater than cdn_url"
                                 .to_string(),
                         ));
                     }
@@ -120,7 +120,15 @@ impl Args {
                         cdn_url
                             .iter()
                             .cloned()
-                            .zip(cdn_url_suffix.iter().cloned())
+                            .zip(
+                                cdn_url_suffix
+                                    .iter()
+                                    .cloned()
+                                    .chain(std::iter::repeat_n(
+                                        "".to_string(),
+                                        cdn_url.len() - cdn_url_suffix.len(),
+                                    )),
+                            )
                             .collect(),
                     )
                 } else {
