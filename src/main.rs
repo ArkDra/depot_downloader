@@ -699,12 +699,16 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
         let decrypted_size = u32::from_le_bytes(
             compressed_data[compressed_data_len - 6..compressed_data_len - 2]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| {
+                    Error::Message("Compressed LZMA chunk has invalid size footer".to_string())
+                })?,
         ) as usize;
         let crc = u32::from_le_bytes(
             compressed_data[compressed_data_len - 10..compressed_data_len - 6]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| {
+                    Error::Message("Compressed LZMA chunk has invalid CRC footer".to_string())
+                })?,
         );
 
         if output.capacity() < decrypted_size {
@@ -738,9 +742,13 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
         let decrypted_size = u32::from_le_bytes(
             compressed_data[compressed_data_len - 11..compressed_data_len - 7]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| {
+                    Error::Message("Compressed zstd chunk has invalid size footer".to_string())
+                })?,
         ) as usize;
-        let crc = u32::from_le_bytes(compressed_data[4..8].try_into().unwrap());
+        let crc = u32::from_le_bytes(compressed_data[4..8].try_into().map_err(|_| {
+            Error::Message("Compressed zstd chunk has invalid CRC header".to_string())
+        })?);
 
         if output.capacity() < decrypted_size {
             output.reserve(decrypted_size - output.len());
