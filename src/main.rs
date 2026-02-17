@@ -21,9 +21,10 @@ use std::{
     io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 use tokio::{
     sync::mpsc,
@@ -62,12 +63,16 @@ const INVALID_CHARS: &[char] = &['/', ':', '*', '?', '"', '<', '>', '|'];
 const INVALID_CHARS: &[char] = &['/'];
 
 static NEXT_URL_INDEX: AtomicUsize = AtomicUsize::new(0);
+static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
 const MAGIC_LZMA: [u8; 3] = [86, 90, 97]; // "VZa"
 const MAGIC_ZSTD: [u8; 4] = [86, 83, 90, 97]; // "VSZa"
 const MAGIC_ZIP: [u8; 4] = [80, 75, 3, 4]; // "PK\x03\x04"
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 2_000;
+const EWMA_ALPHA_PERMILLE: u32 = 200;
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_BREAKER_BASE_COOLDOWN_MS: u64 = 1_500;
 
 #[derive(Parser)]
 struct Args {
@@ -167,52 +172,203 @@ struct FileHandleState {
     remaining_chunks: usize,
 }
 
+struct CdnNodeStats {
+    inflight: AtomicU32,
+    ewma_throughput_kib_s: AtomicU32,
+    ewma_fail_rate_permille: AtomicU32,
+    consecutive_failures: AtomicU32,
+    cooldown_until_ms: AtomicU64,
+}
+
+impl CdnNodeStats {
+    fn new() -> Self {
+        Self {
+            inflight: AtomicU32::new(0),
+            ewma_throughput_kib_s: AtomicU32::new(1_024),
+            ewma_fail_rate_permille: AtomicU32::new(0),
+            consecutive_failures: AtomicU32::new(0),
+            cooldown_until_ms: AtomicU64::new(0),
+        }
+    }
+}
+
 struct CdnHealth {
-    scores: Vec<AtomicU32>,
+    nodes: Vec<CdnNodeStats>,
+}
+
+fn monotonic_now_ms() -> u64 {
+    MONOTONIC_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn ewma_update_u32(old: u32, sample: u32) -> u32 {
+    const EWMA_SCALE_PERMILLE: u64 = 1_000;
+    let old_u64 = old as u64;
+    let sample_u64 = sample as u64;
+    let alpha = EWMA_ALPHA_PERMILLE as u64;
+    let blended = (old_u64.saturating_mul(EWMA_SCALE_PERMILLE.saturating_sub(alpha)))
+        .saturating_add(sample_u64.saturating_mul(alpha))
+        / EWMA_SCALE_PERMILLE;
+    blended.min(u32::MAX as u64) as u32
 }
 
 impl CdnHealth {
     fn new(host_count: usize) -> Self {
-        let mut scores = Vec::with_capacity(host_count);
+        let mut nodes = Vec::with_capacity(host_count);
         for _ in 0..host_count {
-            scores.push(AtomicU32::new(0));
+            nodes.push(CdnNodeStats::new());
         }
-        Self { scores }
+        Self { nodes }
+    }
+
+    fn on_request_start(&self, index: usize) {
+        if let Some(node) = self.nodes.get(index) {
+            node.inflight.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn mark_failure(&self, index: usize) {
-        if let Some(score) = self.scores.get(index) {
-            let _ = score.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(2))
-            });
+        if let Some(node) = self.nodes.get(index) {
+            let _ = node
+                .inflight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(1))
+                });
+
+            let old_fail_rate = node.ewma_fail_rate_permille.load(Ordering::Relaxed);
+            node.ewma_fail_rate_permille
+                .store(ewma_update_u32(old_fail_rate, 1_000), Ordering::Relaxed);
+
+            let failure_streak = match node.consecutive_failures.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |value| Some(value.saturating_add(1)),
+            ) {
+                Ok(previous) => previous.saturating_add(1),
+                Err(previous) => previous.saturating_add(1),
+            };
+            if failure_streak >= CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+                let exponent = (failure_streak - CIRCUIT_BREAKER_FAILURE_THRESHOLD).min(6);
+                let cooldown_ms = CIRCUIT_BREAKER_BASE_COOLDOWN_MS
+                    .checked_shl(exponent)
+                    .unwrap_or(u64::MAX)
+                    .min(CIRCUIT_BREAKER_BASE_COOLDOWN_MS.saturating_mul(10));
+                let open_until = monotonic_now_ms().saturating_add(cooldown_ms);
+                let _ = node.cooldown_until_ms.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |existing| Some(existing.max(open_until)),
+                );
+            }
         }
     }
 
-    fn mark_success(&self, index: usize) {
-        if let Some(score) = self.scores.get(index) {
-            let _ = score.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            });
+    fn mark_success(&self, index: usize, bytes: usize, elapsed_ms: u64) {
+        if let Some(node) = self.nodes.get(index) {
+            let _ = node
+                .inflight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(1))
+                });
+
+            node.consecutive_failures.store(0, Ordering::Relaxed);
+            node.cooldown_until_ms.store(0, Ordering::Relaxed);
+
+            let old_fail_rate = node.ewma_fail_rate_permille.load(Ordering::Relaxed);
+            node.ewma_fail_rate_permille
+                .store(ewma_update_u32(old_fail_rate, 0), Ordering::Relaxed);
+
+            let elapsed = elapsed_ms.max(1);
+            let throughput_kib_s = ((bytes as u64).saturating_mul(1_000) / elapsed / 1_024)
+                .max(1)
+                .min(u32::MAX as u64) as u32;
+            let old_throughput = node.ewma_throughput_kib_s.load(Ordering::Relaxed);
+            node.ewma_throughput_kib_s.store(
+                ewma_update_u32(old_throughput, throughput_kib_s),
+                Ordering::Relaxed,
+            );
         }
     }
 
-    fn pick_best_index(&self, seed: usize) -> usize {
-        let len = self.scores.len();
-        if len == 0 {
+    fn pick_candidate(seed: usize, len: usize, avoid: Option<usize>) -> usize {
+        let mut candidate = seed % len;
+        if let Some(avoid_idx) = avoid
+            && len > 1
+            && candidate == avoid_idx
+        {
+            candidate = (candidate + 1) % len;
+        }
+        candidate
+    }
+
+    fn score_candidate(&self, index: usize, now_ms: u64, avoid: Option<usize>) -> u64 {
+        const FAIL_RATE_WEIGHT: u64 = 25;
+        const INFLIGHT_WEIGHT: u64 = 500;
+        const THROUGHPUT_BASE: u64 = 250_000;
+        const CIRCUIT_OPEN_PENALTY: u64 = 1_000_000;
+        const RETRY_SAME_HOST_PENALTY: u64 = 500_000;
+
+        let Some(node) = self.nodes.get(index) else {
+            return u64::MAX;
+        };
+
+        let inflight = node.inflight.load(Ordering::Relaxed) as u64;
+        let throughput_kib_s = node.ewma_throughput_kib_s.load(Ordering::Relaxed).max(1) as u64;
+        let fail_rate_permille = node.ewma_fail_rate_permille.load(Ordering::Relaxed) as u64;
+        let cooldown_until = node.cooldown_until_ms.load(Ordering::Relaxed);
+
+        let mut score = fail_rate_permille.saturating_mul(FAIL_RATE_WEIGHT);
+        score = score.saturating_add(inflight.saturating_mul(INFLIGHT_WEIGHT));
+        score = score.saturating_add(THROUGHPUT_BASE / throughput_kib_s);
+
+        if cooldown_until > now_ms {
+            score = score.saturating_add(CIRCUIT_OPEN_PENALTY);
+        }
+
+        if let Some(avoid_idx) = avoid
+            && avoid_idx == index
+        {
+            score = score.saturating_add(RETRY_SAME_HOST_PENALTY);
+        }
+
+        score
+    }
+
+    fn pick_best_index(&self, seed: usize, avoid: Option<usize>) -> usize {
+        let len = self.nodes.len();
+        if len <= 1 {
             return 0;
         }
 
-        let mut best_index = seed % len;
-        let mut best_score = self.scores[best_index].load(Ordering::Relaxed);
-        for offset in 1..len {
-            let index = (seed + offset) % len;
-            let score = self.scores[index].load(Ordering::Relaxed);
-            if score < best_score {
-                best_score = score;
-                best_index = index;
+        let first = Self::pick_candidate(seed, len, avoid);
+        let second_seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let mut second = Self::pick_candidate(second_seed, len, avoid);
+        if first == second {
+            second = (second + 1) % len;
+            if let Some(avoid_idx) = avoid
+                && len > 1
+                && second == avoid_idx
+            {
+                second = (second + 1) % len;
             }
         }
-        best_index
+
+        let now_ms = monotonic_now_ms();
+        let first_score = self.score_candidate(first, now_ms, avoid);
+        let second_score = self.score_candidate(second, now_ms, avoid);
+        if first_score < second_score {
+            first
+        } else if second_score < first_score {
+            second
+        } else if self.nodes[first].inflight.load(Ordering::Relaxed)
+            <= self.nodes[second].inflight.load(Ordering::Relaxed)
+        {
+            first
+        } else {
+            second
+        }
     }
 }
 
@@ -243,62 +399,67 @@ impl ChunkInfo {
     ) -> Result<Vec<u8>, Error> {
         let url_list_len = cdn_url_list.len();
         if url_list_len == 0 || url_list_len != cdn_url_suffix_list.len() {
-            return Err(Error::Message(
-                "Invalid CDN URL/suffix configuration.".to_string(),
-            ));
+            return Err(Error::Message(format!(
+                "Invalid CDN URL/suffix configuration: urls={}, suffixes={}",
+                url_list_len,
+                cdn_url_suffix_list.len()
+            )));
         }
 
-        let mut index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
         let mut retry_count = 0;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut last_error: Option<String> = None;
+        let mut last_index: Option<usize> = None;
 
         loop {
+            let selection_seed = NEXT_URL_INDEX
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(retry_count as usize);
+            let avoid_index = if retry_count == 0 { None } else { last_index };
+            let index = cdn_health.pick_best_index(selection_seed, avoid_index);
             let url = format!(
                 "http://{}/depot/{}/chunk/{}{}",
                 &cdn_url_list[index], self.depot_id, self.content_sha, &cdn_url_suffix_list[index]
             );
-            match client.get(&url).send().await {
+            let started_at = Instant::now();
+            cdn_health.on_request_start(index);
+
+            let request_result = match client.get(&url).send().await {
                 Ok(res) => match res.error_for_status() {
-                    Ok(ok_res) => match ok_res.bytes().await {
-                        Ok(body_data) => {
-                            if !body_data.is_empty() {
-                                cdn_health.mark_success(index);
-                                return Ok(body_data.to_vec());
-                            }
-                            if last_error.is_none() {
-                                last_error = Some(format!("empty response body from {url}"));
-                            }
-                            cdn_health.mark_failure(index);
-                        }
-                        Err(e) => {
-                            if last_error.is_none() {
-                                last_error =
-                                    Some(format!("failed to read response body from {url}: {e}"));
-                            }
-                            cdn_health.mark_failure(index);
-                        }
-                    },
-                    Err(e) => {
-                        if last_error.is_none() {
-                            last_error = Some(format!("http status error from {url}: {e}"));
-                        }
-                        cdn_health.mark_failure(index);
-                    }
+                    Ok(ok_res) => ok_res
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("failed to read response body from {url}: {e}")),
+                    Err(e) => Err(format!("http status error from {url}: {e}")),
                 },
-                Err(e) => {
+                Err(e) => Err(format!("request error for {url}: {e}")),
+            };
+
+            let elapsed_ms = started_at.elapsed().as_millis().max(1) as u64;
+            match request_result {
+                Ok(body_data) => {
+                    if !body_data.is_empty() {
+                        cdn_health.mark_success(index, body_data.len(), elapsed_ms);
+                        return Ok(body_data.to_vec());
+                    }
                     if last_error.is_none() {
-                        last_error = Some(format!("request error for {url}: {e}"));
+                        last_error = Some(format!("empty response body from {url}"));
+                    }
+                    cdn_health.mark_failure(index);
+                }
+                Err(err_message) => {
+                    if last_error.is_none() {
+                        last_error = Some(err_message);
                     }
                     cdn_health.mark_failure(index);
                 }
             }
 
+            last_index = Some(index);
             retry_count += 1;
             if retry_count < retry_num {
                 sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
-                index = cdn_health.pick_best_index(NEXT_URL_INDEX.fetch_add(1, Ordering::Relaxed));
             } else {
                 return Err(Error::Message(format!(
                     "Failed to download chunk {} after {} attempts: {}",
@@ -419,17 +580,40 @@ async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
         .as_array()
         .ok_or_else(|| Error::Message("servers not found".to_string()))?;
 
-    let mut url_list = Vec::new();
+    let mut strict = Vec::new();
+    let mut relaxed = Vec::new();
+    let mut seen = HashSet::new();
     for server in servers {
-        if server["weighted_load"].as_i64() <= Some(130)
-            && let Some(host) = server["host"].as_str()
-            && host.contains("steamcontent.com")
-            && host.contains("steampipe")
-        {
-            url_list.push(host.to_string());
+        let host = match server["host"].as_str() {
+            Some(h) if !h.is_empty() => h,
+            _ => continue,
+        };
+        if !host.contains("steamcontent.com") {
+            continue;
+        }
+        if !seen.insert(host.to_string()) {
+            continue;
+        }
+
+        let weighted_load = server["weighted_load"].as_i64().unwrap_or(i64::MAX);
+        if weighted_load <= 130 && host.contains("steampipe") {
+            strict.push(host.to_string());
+        } else {
+            relaxed.push(host.to_string());
         }
     }
-    Ok(url_list)
+    if !strict.is_empty() {
+        return Ok(strict);
+    }
+    if !relaxed.is_empty() {
+        return Ok(relaxed);
+    }
+
+    Err(Error::Message(
+        "No available CDN hosts from Steam directory service. \
+You can use the `cdn -u <host> -s <token>` mode or check network/proxy settings."
+            .to_string(),
+    ))
 }
 
 fn prepare_output_file(
