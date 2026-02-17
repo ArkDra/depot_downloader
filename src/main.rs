@@ -407,6 +407,7 @@ impl ChunkInfo {
         }
 
         let mut retry_count = 0;
+        let max_attempts = retry_num.max(1);
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut last_error: Option<String> = None;
         let mut last_index: Option<usize> = None;
@@ -457,14 +458,14 @@ impl ChunkInfo {
 
             last_index = Some(index);
             retry_count += 1;
-            if retry_count < retry_num {
+            if retry_count < max_attempts {
                 sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
             } else {
                 return Err(Error::Message(format!(
                     "Failed to download chunk {} after {} attempts: {}",
                     self.content_sha,
-                    retry_num,
+                    max_attempts,
                     last_error.unwrap_or_else(|| "unknown error".to_string())
                 )));
             }
