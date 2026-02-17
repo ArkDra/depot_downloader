@@ -645,22 +645,25 @@ fn prepare_output_file(
     };
 
     if path.exists() {
-        let mut file = File::open(&path)?;
-        let mut hasher = Sha1::default();
-        let mut buffer = vec![0u8; 10485760];
+        let metadata = fs::metadata(&path)?;
+        if metadata.len() == file_size {
+            let mut file = File::open(&path)?;
+            let mut hasher = Sha1::default();
+            let mut buffer = vec![0u8; 10485760];
 
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+            loop {
+                let bytes_read = file.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes_read]);
             }
-            hasher.update(&buffer[..bytes_read]);
-        }
 
-        let downloaded_file_sha = HEXLOWER.encode(&hasher.finalize());
-        if file_sha == downloaded_file_sha {
-            println!("{} already downloaded", file_name);
-            return Ok((true, path));
+            let downloaded_file_sha = HEXLOWER.encode(&hasher.finalize());
+            if file_sha == downloaded_file_sha {
+                println!("{} already downloaded", file_name);
+                return Ok((true, path));
+            }
         }
     } else {
         if let Some(parent_dir) = path.parent()
