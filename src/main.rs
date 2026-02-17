@@ -407,7 +407,7 @@ impl ChunkInfo {
         }
 
         let mut retry_count = 0;
-        let max_attempts = retry_num.max(1);
+        let max_attempts = retry_num.saturating_add(1);
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut last_error: Option<String> = None;
         let mut last_index: Option<usize> = None;
