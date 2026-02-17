@@ -103,7 +103,7 @@ struct AppConfig<'a> {
 }
 
 impl Args {
-    pub fn get_args(&self) -> AppConfig<'_> {
+    pub fn get_args(&self) -> Result<AppConfig<'_>, Error> {
         let cdn_pairs = match &self.command {
             Some(Commands::Cdn {
                 cdn_url,
@@ -111,7 +111,10 @@ impl Args {
             }) => {
                 if let Some(cdn_url_suffix) = cdn_url_suffix {
                     if cdn_url.len() != cdn_url_suffix.len() {
-                        panic!("The number of cdn_url and cdn_url_suffix must be the same");
+                        return Err(Error::Message(
+                            "The number of cdn_url and cdn_url_suffix must be the same"
+                                .to_string(),
+                        ));
                     }
                     Some(
                         cdn_url
@@ -132,7 +135,7 @@ impl Args {
             }
             None => None,
         };
-        AppConfig {
+        Ok(AppConfig {
             manifest_path: &self.manifest_path,
             depot_key: &self.depot_key,
             output_path: &self.output_path,
@@ -140,7 +143,7 @@ impl Args {
             retry_num: self.retry_num,
             cdn_pairs,
             file_names: self.file_names.as_deref(),
-        }
+        })
     }
 }
 
@@ -916,7 +919,7 @@ async fn decode_and_write_chunks(
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let config = args.get_args();
+    let config = args.get_args()?;
     let decoded_depot_key: Arc<[u8]> = HEXLOWER.decode(config.depot_key.as_bytes())?.into();
     let normalized_file_names = config.file_names.map(|names| {
         names
