@@ -417,8 +417,8 @@ impl ChunkInfo {
             )));
         }
 
-        let mut retry_count = 0;
         let max_attempts = retry_num.saturating_add(1);
+        let mut attempts_made = 0;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut last_error: Option<String> = None;
         let mut last_index: Option<usize> = None;
@@ -426,8 +426,8 @@ impl ChunkInfo {
         loop {
             let selection_seed = NEXT_URL_INDEX
                 .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(retry_count as usize);
-            let avoid_index = if retry_count == 0 { None } else { last_index };
+                .wrapping_add(attempts_made as usize);
+            let avoid_index = if attempts_made == 0 { None } else { last_index };
             let index = cdn_health.pick_best_index(selection_seed, avoid_index);
             let url = format!(
                 "http://{}/depot/{}/chunk/{}{}",
@@ -468,8 +468,8 @@ impl ChunkInfo {
             }
 
             last_index = Some(index);
-            retry_count += 1;
-            if retry_count < max_attempts {
+            attempts_made += 1;
+            if attempts_made < max_attempts {
                 sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
             } else {
