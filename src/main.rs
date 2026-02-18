@@ -698,7 +698,7 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
             ));
         }
 
-        let raw_data = &compressed_data[12..compressed_data_len - 10];
+        let raw_data = &compressed_data[12..compressed_data_len - 9];
         let decrypted_size = u32::from_le_bytes(
             compressed_data[compressed_data_len - 6..compressed_data_len - 2]
                 .try_into()
@@ -726,6 +726,16 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
             .map_err(|e| Error::Message(format!("LZMA decoder init error: {e:?}")))?
             .process_vec(raw_data, output, Run)
             .map_err(|e| Error::Message(format!("LZMA decode error: {e:?}")))?;
+
+        // Raw LZMA decoding can produce bytes beyond expected payload size.
+        if output.len() < decrypted_size {
+            return Err(Error::Message(format!(
+                "decompressed lzma size too short: expected {} got {}",
+                decrypted_size,
+                output.len()
+            )));
+        }
+        output.truncate(decrypted_size);
 
         if crc == crc32fast::hash(output) {
             Ok(())
