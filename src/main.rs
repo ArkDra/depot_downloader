@@ -8,6 +8,7 @@ use aes::{
 };
 use clap::{Parser, Subcommand};
 use data_encoding::{BASE64_MIME, HEXLOWER};
+use flume::{Receiver, Sender};
 use futures::stream::{self, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use liblzma::stream::{Action::Run, Filters, Stream};
@@ -27,7 +28,6 @@ use std::{
     time::Instant,
 };
 use tokio::{
-    sync::mpsc,
     task::spawn_blocking,
     time::{Duration, sleep},
 };
@@ -832,7 +832,7 @@ async fn download_chunks(
     retry_num: u32,
     cdn_health: Arc<CdnHealth>,
     pb: &ProgressBar,
-    tx: mpsc::Sender<DownloadedChunk>,
+    tx: Sender<DownloadedChunk>,
 ) -> Result<(), Error> {
     stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
         .try_for_each_concurrent(download_concurrency, |chunk_info| {
@@ -852,7 +852,7 @@ async fn download_chunks(
                     .await?;
                 pb.inc(data.len() as u64);
                 tx_for_task
-                    .send(DownloadedChunk { chunk_info, data })
+                    .send_async(DownloadedChunk { chunk_info, data })
                     .await
                     .map_err(|_| {
                         Error::Message(
@@ -866,29 +866,21 @@ async fn download_chunks(
 }
 
 async fn decode_and_write_chunks(
-    rx: mpsc::Receiver<DownloadedChunk>,
+    rx: Receiver<DownloadedChunk>,
     decode_concurrency: usize,
     depot_key: Arc<[u8]>,
     file_handles: Arc<HashMap<PathBuf, Arc<Mutex<FileHandleState>>>>,
 ) -> Result<(), Error> {
-    let shared_rx = Arc::new(Mutex::new(rx));
     let mut workers = Vec::with_capacity(decode_concurrency);
 
     for _ in 0..decode_concurrency {
-        let rx_for_worker = Arc::clone(&shared_rx);
+        let rx_for_worker = rx.clone();
         let depot_key_for_worker = Arc::clone(&depot_key);
         let file_handles_for_worker = Arc::clone(&file_handles);
         let worker = spawn_blocking(move || -> Result<(), Error> {
             let mut output_buffer = Vec::new();
             loop {
-                let downloaded_chunk = {
-                    let mut guard = rx_for_worker
-                        .lock()
-                        .map_err(|_| Error::Message("Decode queue lock poisoned".to_string()))?;
-                    guard.blocking_recv()
-                };
-
-                let Some(DownloadedChunk { chunk_info, data }) = downloaded_chunk else {
+                let Ok(DownloadedChunk { chunk_info, data }) = rx_for_worker.recv() else {
                     break;
                 };
 
@@ -1043,7 +1035,7 @@ async fn main() -> Result<(), Error> {
     let pb = ProgressBar::new(estimated_download_bytes).with_style(progress_style);
 
     // Step 3: split into download stage and decode/write stage with bounded backpressure
-    let (tx, rx) = mpsc::channel(decode_queue_capacity);
+    let (tx, rx) = flume::bounded(decode_queue_capacity);
     let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
     let file_handles = Arc::new(init_file_handles(&file_chunk_counts)?);
 

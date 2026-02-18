@@ -12,6 +12,7 @@ clap = { version = "4.5.47", features = ["derive"] }
 crc32fast = "1.5.0"
 data-encoding = "2.9.0"
 ecb = "0.1.2"
+flume = "0.12.0"
 futures = "0.3.31"
 indicatif = { version = "0.17.11" }
 liblzma = { version = "0.4.4", features = ["parallel"] }
