@@ -977,7 +977,7 @@ async fn main() -> Result<(), Error> {
 
     let cpu_num = num_cpus::get();
     let download_concurrency = (cpu_num * 4).max(1);
-    let decode_concurrency = cpu_num.max(1);
+    let decode_concurrency = num_cpus::get_physical().max(1);
     let decode_queue_capacity = (decode_concurrency * 2).max(1);
     let mut all_chunks = Vec::new();
     let mut file_chunk_counts = HashMap::new();
