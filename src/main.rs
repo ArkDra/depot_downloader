@@ -869,6 +869,7 @@ async fn decode_and_write_chunks(
         let depot_key_for_worker = Arc::clone(&depot_key);
         let file_handles_for_worker = Arc::clone(&file_handles);
         let worker = spawn_blocking(move || -> Result<(), Error> {
+            let mut output_buffer = Vec::new();
             loop {
                 let downloaded_chunk = {
                     let mut guard = rx_for_worker
@@ -884,14 +885,13 @@ async fn decode_and_write_chunks(
                 let original_size = chunk_info.original_size;
                 let mut decrypt = Decrypt::new(data, depot_key_for_worker.as_ref());
                 let decrypted_data = decrypt.decrypt_chunk()?;
-                let mut output = Vec::with_capacity(original_size as usize);
-                decompress_into(&decrypted_data, &mut output)?;
+                decompress_into(&decrypted_data, &mut output_buffer)?;
 
-                if output.len() != original_size as usize {
+                if output_buffer.len() != original_size as usize {
                     return Err(Error::Message(format!(
                         "Size mismatch: expected {} got {}",
                         original_size,
-                        output.len()
+                        output_buffer.len()
                     )));
                 }
 
@@ -910,7 +910,7 @@ async fn decode_and_write_chunks(
                     ))
                 })?;
                 file_state.file.seek(SeekFrom::Start(chunk_info.offset))?;
-                file_state.file.write_all(&output)?;
+                file_state.file.write_all(&output_buffer)?;
                 if file_state.remaining_chunks == 0 {
                     return Err(Error::Message(format!(
                         "Unexpected extra chunk write for {}",
