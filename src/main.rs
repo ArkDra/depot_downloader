@@ -11,7 +11,7 @@ use data_encoding::{BASE64_MIME, HEXLOWER};
 use flume::{Receiver, Sender};
 use futures::stream::{self, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use liblzma::stream::{Action::Run, Filters, Stream};
+use lzma_rust2::LzmaReader;
 use protobuf::Message;
 use reqwest::{Client, Proxy};
 use serde_json::Value;
@@ -718,24 +718,24 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
             output.reserve(decrypted_size - output.len());
         }
 
-        let mut filter = Filters::new();
-        filter
-            .lzma1_properties(&compressed_data[7..12])
-            .map_err(|e| Error::Message(format!("LZMA properties error: {e:?}")))?;
-        Stream::new_raw_decoder(&filter)
-            .map_err(|e| Error::Message(format!("LZMA decoder init error: {e:?}")))?
-            .process_vec(raw_data, output, Run)
-            .map_err(|e| Error::Message(format!("LZMA decode error: {e:?}")))?;
-
-        // Raw LZMA decoding can produce bytes beyond expected payload size.
-        if output.len() < decrypted_size {
-            return Err(Error::Message(format!(
-                "decompressed lzma size too short: expected {} got {}",
-                decrypted_size,
-                output.len()
-            )));
-        }
-        output.truncate(decrypted_size);
+        let props = compressed_data[7];
+        let dict_size = u32::from_le_bytes(
+            compressed_data[8..12]
+                .try_into()
+                .map_err(|_| Error::Message("Compressed LZMA chunk has invalid dict size".to_string()))?,
+        );
+        let mut reader = LzmaReader::new_with_props(
+            raw_data,
+            decrypted_size as u64,
+            props,
+            dict_size,
+            None,
+        )
+        .map_err(|e| Error::Message(format!("LZMA decoder init error: {e}")))?;
+        output.resize(decrypted_size, 0);
+        reader
+            .read_exact(output.as_mut_slice())
+            .map_err(|e| Error::Message(format!("LZMA decode error: {e}")))?;
 
         if crc == crc32fast::hash(output) {
             Ok(())
