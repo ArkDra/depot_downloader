@@ -967,10 +967,10 @@ async fn main() -> Result<(), Error> {
         }
     };
 
-    let cpu_num = num_cpus::get();
-    let download_concurrency = (cpu_num * 4).max(1);
-    let decode_concurrency = num_cpus::get_physical().max(1);
-    let decode_queue_capacity = (decode_concurrency * 2).max(1);
+    let physical_cores = num_cpus::get_physical();
+    let decode_concurrency = physical_cores.max(2);
+    let decode_queue_capacity = (decode_concurrency * 4).max(8);
+    let download_concurrency = (decode_concurrency * 6).max(12).min(64);
     let mut all_chunks = Vec::new();
     let mut file_chunk_counts = HashMap::new();
     let mut estimated_download_bytes = 0;
