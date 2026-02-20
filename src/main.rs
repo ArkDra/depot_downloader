@@ -19,10 +19,10 @@ use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -180,7 +180,7 @@ struct DownloadedChunk {
 
 struct FileHandleState {
     file: File,
-    remaining_chunks: usize,
+    remaining_chunks: AtomicUsize,
 }
 
 struct CdnNodeStats {
@@ -803,7 +803,7 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
 
 fn init_file_handles(
     file_chunk_counts: &HashMap<PathBuf, usize>,
-) -> Result<HashMap<PathBuf, Arc<Mutex<FileHandleState>>>, Error> {
+) -> Result<HashMap<PathBuf, Arc<FileHandleState>>, Error> {
     let mut file_handles = HashMap::with_capacity(file_chunk_counts.len());
 
     for (path, chunk_count) in file_chunk_counts {
@@ -813,14 +813,52 @@ fn init_file_handles(
             .open(path)?;
         file_handles.insert(
             path.clone(),
-            Arc::new(Mutex::new(FileHandleState {
+            Arc::new(FileHandleState {
                 file,
-                remaining_chunks: *chunk_count,
-            })),
+                remaining_chunks: AtomicUsize::new(*chunk_count),
+            }),
         );
     }
 
     Ok(file_handles)
+}
+
+#[cfg(windows)]
+fn write_chunk_at(file: &File, mut offset: u64, mut data: &[u8]) -> Result<(), Error> {
+    use std::os::windows::fs::FileExt;
+
+    while !data.is_empty() {
+        let written = file.seek_write(data, offset)?;
+        if written == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "failed to write chunk data",
+            )));
+        }
+        offset = offset.saturating_add(written as u64);
+        data = &data[written..];
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_chunk_at(file: &File, mut offset: u64, mut data: &[u8]) -> Result<(), Error> {
+    use std::os::unix::fs::FileExt;
+
+    while !data.is_empty() {
+        let written = file.write_at(data, offset)?;
+        if written == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "failed to write chunk data",
+            )));
+        }
+        offset = offset.saturating_add(written as u64);
+        data = &data[written..];
+    }
+
+    Ok(())
 }
 
 async fn download_chunks(
@@ -869,7 +907,7 @@ async fn decode_and_write_chunks(
     rx: Receiver<DownloadedChunk>,
     decode_concurrency: usize,
     depot_key: Arc<[u8]>,
-    file_handles: Arc<HashMap<PathBuf, Arc<Mutex<FileHandleState>>>>,
+    file_handles: Arc<HashMap<PathBuf, Arc<FileHandleState>>>,
 ) -> Result<(), Error> {
     let mut workers = Vec::with_capacity(decode_concurrency);
 
@@ -905,23 +943,20 @@ async fn decode_and_write_chunks(
                             chunk_info.file_path.display()
                         ))
                     })?;
-                let mut file_state = file_handle.lock().map_err(|_| {
-                    Error::Message(format!(
-                        "File handle lock poisoned for {}",
-                        chunk_info.file_path.display()
-                    ))
-                })?;
-                file_state.file.seek(SeekFrom::Start(chunk_info.offset))?;
-                file_state.file.write_all(&output_buffer)?;
-                if file_state.remaining_chunks == 0 {
-                    return Err(Error::Message(format!(
-                        "Unexpected extra chunk write for {}",
-                        chunk_info.file_path.display()
-                    )));
-                }
-                file_state.remaining_chunks -= 1;
-                if file_state.remaining_chunks == 0 {
-                    file_state.file.flush()?;
+                write_chunk_at(&file_handle.file, chunk_info.offset, &output_buffer)?;
+                let prev = file_handle
+                    .remaining_chunks
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_sub(1)
+                    })
+                    .map_err(|_| {
+                        Error::Message(format!(
+                            "Unexpected extra chunk write for {}",
+                            chunk_info.file_path.display()
+                        ))
+                    })?;
+                if prev == 1 {
+                    file_handle.file.sync_data()?;
                 }
             }
 
