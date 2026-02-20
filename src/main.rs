@@ -86,7 +86,7 @@ struct Args {
     proxy_url: Option<String>,
     #[arg(short = 'r', long, default_value = "3")]
     retry_num: u32,
-    #[arg(short = 'f', long, num_args = 1.., value_delimiter = ',')]
+    #[arg(short = 'f', long, value_delimiter = ',')]
     file_names: Option<Vec<String>>,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -158,9 +158,9 @@ impl Args {
 #[derive(Subcommand)]
 enum Commands {
     Cdn {
-        #[arg(short = 'u', long, num_args = 1.., value_delimiter = ',')]
+        #[arg(short = 'u', long, value_delimiter = ',')]
         cdn_url: Vec<String>,
-        #[arg(short = 's', long, num_args = 1.., value_delimiter = ',')]
+        #[arg(short = 's', long, value_delimiter = ',')]
         cdn_url_suffix: Option<Vec<String>>,
     },
 }
