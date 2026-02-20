@@ -501,16 +501,45 @@ impl Manifest {
         &self,
     ) -> Result<(ContentManifestPayload, ContentManifestMetadata), Error> {
         let mut cursor = Cursor::new(&self.manifest_content);
+        let manifest_len = self.manifest_content.len() as u64;
         let mut payload_length = [0u8; 4];
         std::io::Cursor::seek(&mut cursor, SeekFrom::Start(4))?;
         cursor.read_exact(&mut payload_length)?;
         let payload_length = u32::from_le_bytes(payload_length);
+        let payload_end = cursor
+            .position()
+            .checked_add(payload_length as u64)
+            .ok_or_else(|| {
+                Error::Message("Manifest payload length overflows cursor position".to_string())
+            })?;
+        if payload_end > manifest_len {
+            return Err(Error::Message(format!(
+                "Manifest payload out of bounds: cursor={} len={} manifest={}",
+                cursor.position(),
+                payload_length,
+                manifest_len
+            )));
+        }
         let mut payload = vec![0u8; payload_length as usize];
         cursor.read_exact(&mut payload)?;
         std::io::Cursor::seek(&mut cursor, SeekFrom::Current(4))?;
         let mut metadata_length = [0u8; 4];
         cursor.read_exact(&mut metadata_length)?;
         let metadata_length = u32::from_le_bytes(metadata_length);
+        let metadata_end = cursor
+            .position()
+            .checked_add(metadata_length as u64)
+            .ok_or_else(|| {
+                Error::Message("Manifest metadata length overflows cursor position".to_string())
+            })?;
+        if metadata_end > manifest_len {
+            return Err(Error::Message(format!(
+                "Manifest metadata out of bounds: cursor={} len={} manifest={}",
+                cursor.position(),
+                metadata_length,
+                manifest_len
+            )));
+        }
         let mut metadata = vec![0u8; metadata_length as usize];
         cursor.read_exact(&mut metadata)?;
         let payload = ContentManifestPayload::parse_from_bytes(&payload)?;
@@ -1002,7 +1031,7 @@ async fn main() -> Result<(), Error> {
     let physical_cores = num_cpus::get_physical();
     let decode_concurrency = physical_cores.max(2);
     let decode_queue_capacity = (decode_concurrency * 4).max(8);
-    let download_concurrency = (decode_concurrency * 6).max(12).min(64);
+    let download_concurrency = (decode_concurrency * 6).clamp(12, 64);
     let mut all_chunks = Vec::new();
     let mut file_targets = Vec::new();
     let mut estimated_download_bytes = 0;
