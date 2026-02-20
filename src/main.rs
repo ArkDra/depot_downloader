@@ -17,7 +17,7 @@ use reqwest::{Client, Proxy};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs::{self, File},
     io::{BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -169,7 +169,7 @@ struct ChunkInfo {
     offset: u64,
     original_size: u32,
     depot_id: u32,
-    file_path: PathBuf,
+    file_id: usize,
     content_sha: String,
 }
 
@@ -180,6 +180,7 @@ struct DownloadedChunk {
 
 struct FileHandleState {
     file: File,
+    path: PathBuf,
     remaining_chunks: AtomicUsize,
 }
 
@@ -388,14 +389,14 @@ impl ChunkInfo {
         offset: u64,
         original_size: u32,
         depot_id: u32,
-        file_path: PathBuf,
+        file_id: usize,
         content_sha: String,
     ) -> Self {
         ChunkInfo {
             offset,
             original_size,
             depot_id,
-            file_path,
+            file_id,
             content_sha,
         }
     }
@@ -802,22 +803,20 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
 }
 
 fn init_file_handles(
-    file_chunk_counts: &HashMap<PathBuf, usize>,
-) -> Result<HashMap<PathBuf, Arc<FileHandleState>>, Error> {
-    let mut file_handles = HashMap::with_capacity(file_chunk_counts.len());
+    file_targets: &[(PathBuf, usize)],
+) -> Result<Vec<Arc<FileHandleState>>, Error> {
+    let mut file_handles = Vec::with_capacity(file_targets.len());
 
-    for (path, chunk_count) in file_chunk_counts {
+    for (path, chunk_count) in file_targets {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)?;
-        file_handles.insert(
-            path.clone(),
-            Arc::new(FileHandleState {
-                file,
-                remaining_chunks: AtomicUsize::new(*chunk_count),
-            }),
-        );
+        file_handles.push(Arc::new(FileHandleState {
+            file,
+            path: path.clone(),
+            remaining_chunks: AtomicUsize::new(*chunk_count),
+        }));
     }
 
     Ok(file_handles)
@@ -907,7 +906,7 @@ async fn decode_and_write_chunks(
     rx: Receiver<DownloadedChunk>,
     decode_concurrency: usize,
     depot_key: Arc<[u8]>,
-    file_handles: Arc<HashMap<PathBuf, Arc<FileHandleState>>>,
+    file_handles: Arc<Vec<Arc<FileHandleState>>>,
 ) -> Result<(), Error> {
     let mut workers = Vec::with_capacity(decode_concurrency);
 
@@ -936,12 +935,9 @@ async fn decode_and_write_chunks(
                 }
 
                 let file_handle = file_handles_for_worker
-                    .get(&chunk_info.file_path)
+                    .get(chunk_info.file_id)
                     .ok_or_else(|| {
-                        Error::Message(format!(
-                            "Missing file handle for {}",
-                            chunk_info.file_path.display()
-                        ))
+                        Error::Message(format!("Missing file handle for file_id {}", chunk_info.file_id))
                     })?;
                 write_chunk_at(&file_handle.file, chunk_info.offset, &output_buffer)?;
                 let prev = file_handle
@@ -952,7 +948,7 @@ async fn decode_and_write_chunks(
                     .map_err(|_| {
                         Error::Message(format!(
                             "Unexpected extra chunk write for {}",
-                            chunk_info.file_path.display()
+                            file_handle.path.display()
                         ))
                     })?;
                 if prev == 1 {
@@ -1007,7 +1003,7 @@ async fn main() -> Result<(), Error> {
     let decode_queue_capacity = (decode_concurrency * 4).max(8);
     let download_concurrency = (decode_concurrency * 6).max(12).min(64);
     let mut all_chunks = Vec::new();
-    let mut file_chunk_counts = HashMap::new();
+    let mut file_targets = Vec::new();
     let mut estimated_download_bytes = 0;
     // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
@@ -1040,7 +1036,12 @@ async fn main() -> Result<(), Error> {
             }
 
             let chunk_count = file.chunks.len();
-            let mut file_chunks = Vec::with_capacity(file.chunks.len());
+            if chunk_count == 0 {
+                continue;
+            }
+            let file_id = file_targets.len();
+            file_targets.push((path, chunk_count));
+            let mut file_chunks = Vec::with_capacity(chunk_count);
             // Step 2: Extract all chunk information
             for chunk in file.chunks {
                 if chunk.cb_compressed != 0 {
@@ -1050,16 +1051,13 @@ async fn main() -> Result<(), Error> {
                     chunk.offset,
                     chunk.cb_original,
                     metadata.depot_id,
-                    path.to_owned(),
+                    file_id,
                     HEXLOWER.encode(&chunk.sha),
                 );
                 file_chunks.push(chunk_info);
             }
 
             all_chunks.extend(file_chunks);
-            if chunk_count != 0 {
-                file_chunk_counts.insert(path, chunk_count);
-            }
         }
     }
 
@@ -1072,7 +1070,7 @@ async fn main() -> Result<(), Error> {
     // Step 3: split into download stage and decode/write stage with bounded backpressure
     let (tx, rx) = flume::bounded(decode_queue_capacity);
     let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
-    let file_handles = Arc::new(init_file_handles(&file_chunk_counts)?);
+    let file_handles = Arc::new(init_file_handles(&file_targets)?);
 
     tokio::try_join!(
         download_chunks(
