@@ -1,15 +1,17 @@
 # Depot Downloader
 
-Depot Downloader is a Rust-based tool for downloading Steam depot asynchronously.
+Depot Downloader is a Rust-based CLI tool for downloading Steam depot content.
 
 ## Features
-- Asynchronous downloading of Steam depot
-- Efficient and scalable architecture
-- Command-line interface
+- Asynchronous download pipeline with concurrent decode/write workers
+- Automatic CDN discovery with optional manual CDN override
+- Multi-format chunk support (LZMA, Zstd, ZIP)
+- Integrity checks during resume and chunk decode
+- Command-line interface with proxy, retry, and file filtering controls
 
 ## Build
 
-Clone the repository and build the project using Cargo:
+Release build:
 
 ```bash
 cargo build --release
@@ -19,45 +21,48 @@ The compiled binary will be located in the `target/release` directory.
 
 ## Usage
 
-Run the downloader from the command line:
-
 ```bash
 depot_downloader [OPTIONS] [COMMAND]
 ```
 
-### Example
+### Basic
 
 ```bash
-depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890
+depot_downloader -m 123456_1234567890.manifest -k <64_hex_chars>
 ```
 
-or
+### With proxy/output/retry
 
 ```bash
-depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890 -o output_directory -r 3 -p http://127.0.0.1:1080
+depot_downloader -m 123456_1234567890.manifest -k <64_hex_chars> -o output_directory -r 3 -p http://127.0.0.1:1080
 ```
 
-#### Options
-
-- `-m, --manifest-path <MANIFEST_PATH>`: Manifest file path (Required)
-- `-k, --depot-key <DEPOT_KEY>`: Depot decryption key (Required)
-- `-o, --output-path <OUTPUT_PATH>`: Output directory
-- `-p, --proxy_url <PROXY_URL>`: Proxy URL
-- `-r, --retry-num <RETRY_NUM>`: Retry number
-- `-f, --file-names <FILE_NAMES>`: Selected file names
-- Other options may be available; run with `-h` for details.
-
-#### CDN Parameters (Optional)
-
-- `-u, --cdn-url <CDN_URL>`: CDN URL
-- `-s, --cdn-suffix <CDN_SUFFIX>`: CDN URL suffix
-
-You can specify custom CDN URLs and suffixes via subcommands, for example:
+### Download selected files
 
 ```bash
-depot_downloader -m 123456_1234567890.manifest -k abcdef1234567890 cdn -u steampipe.akamaized.net,fastly.cdn.steampipe.steamcontent.com -s /suffix1,/suffix2
+depot_downloader -m 123456_1234567890.manifest -k <64_hex_chars> -f bin/game.exe,data/config.json
 ```
+
+### Use manual CDN hosts and suffixes
+
+```bash
+depot_downloader -m 123456_1234567890.manifest -k <64_hex_chars> cdn -u steampipe.akamaized.net,fastly.cdn.steampipe.steamcontent.com -s /token_a,/token_b
+```
+
+## Options
+
+- `-m, --manifest-path <MANIFEST_PATH>`: Manifest file path. Required.
+- `-k, --depot-key <DEPOT_KEY>`: Depot decryption key as lowercase hex (AES-256 key, typically 64 hex chars). Required.
+- `-o, --output-path <OUTPUT_PATH>`: Output directory. Default is `<current_dir>/<depot_id>/<file_name>`.
+- `-p, --proxy-url <PROXY_URL>`: HTTP/HTTPS proxy URL.
+- `-r, --retry-num <RETRY_NUM>`: Retry count per chunk.
+- `-f, --file-names <FILE_NAMES>`: Comma-separated file paths to download selectively.
+
+Subcommand `cdn`:
+
+- `-u, --cdn-url <CDN_URL>`: Comma-separated CDN host list.
+- `-s, --cdn-url-suffix <CDN_URL_SUFFIX>`: Comma-separated URL suffix list.
 
 ## License
 
-This project is licensed under the MIT License or Apache License, Version 2.0.
+depot_downloader is licensed under the MIT License or Apache License, Version 2.0.
