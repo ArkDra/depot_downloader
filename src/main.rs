@@ -1110,6 +1110,11 @@ async fn main() -> Result<(), Error> {
     .progress_chars("#>-");
     let pb = ProgressBar::new(estimated_download_bytes).with_style(progress_style);
     let downloaded_bytes = Arc::new(AtomicU64::new(0));
+
+    // Step 3: split into download stage and decode/write stage with bounded backpressure
+    let (tx, rx) = flume::bounded(decode_queue_capacity);
+    let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
+    let file_handles = Arc::new(init_file_handles(&file_targets));
     let progress_stop = Arc::new(AtomicBool::new(false));
     let progress_task = {
         let pb_for_task = pb.clone();
@@ -1127,11 +1132,6 @@ async fn main() -> Result<(), Error> {
             }
         })
     };
-
-    // Step 3: split into download stage and decode/write stage with bounded backpressure
-    let (tx, rx) = flume::bounded(decode_queue_capacity);
-    let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
-    let file_handles = Arc::new(init_file_handles(&file_targets));
 
     let work_result = tokio::try_join!(
         download_chunks(
@@ -1151,8 +1151,13 @@ async fn main() -> Result<(), Error> {
     progress_stop.store(true, Ordering::Relaxed);
     progress_task.await?;
     pb.set_position(downloaded_bytes.load(Ordering::Relaxed).min(estimated_download_bytes));
-    pb.finish();
-    work_result?;
+    match work_result {
+        Ok(_) => pb.finish(),
+        Err(err) => {
+            pb.abandon_with_message(format!("Download failed: {err}"));
+            return Err(err);
+        }
+    }
 
     Ok(())
 }
