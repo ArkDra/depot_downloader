@@ -179,7 +179,7 @@ struct DownloadedChunk {
 }
 
 struct FileHandleState {
-    file: File,
+    file: OnceLock<std::io::Result<File>>,
     path: PathBuf,
     remaining_chunks: AtomicUsize,
 }
@@ -833,22 +833,34 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
 
 fn init_file_handles(
     file_targets: &[(PathBuf, usize)],
-) -> Result<Vec<Arc<FileHandleState>>, Error> {
+) -> Vec<Arc<FileHandleState>> {
     let mut file_handles = Vec::with_capacity(file_targets.len());
 
     for (path, chunk_count) in file_targets {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
         file_handles.push(Arc::new(FileHandleState {
-            file,
+            file: OnceLock::new(),
             path: path.clone(),
             remaining_chunks: AtomicUsize::new(*chunk_count),
         }));
     }
 
-    Ok(file_handles)
+    file_handles
+}
+
+fn get_or_open_file(file_handle: &FileHandleState) -> Result<&File, Error> {
+    let file_result = file_handle.file.get_or_init(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_handle.path)
+    });
+    match file_result {
+        Ok(file) => Ok(file),
+        Err(err) => Err(Error::Message(format!(
+            "Failed to open file {}: {err}",
+            file_handle.path.display()
+        ))),
+    }
 }
 
 #[cfg(windows)]
@@ -969,7 +981,8 @@ async fn decode_and_write_chunks(
                     .ok_or_else(|| {
                         Error::Message(format!("Missing file handle for file_id {}", chunk_info.file_id))
                     })?;
-                write_chunk_at(&file_handle.file, chunk_info.offset, &output_buffer)?;
+                let file = get_or_open_file(file_handle)?;
+                write_chunk_at(file, chunk_info.offset, &output_buffer)?;
                 let prev = file_handle
                     .remaining_chunks
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -982,7 +995,7 @@ async fn decode_and_write_chunks(
                         ))
                     })?;
                 if prev == 1 {
-                    file_handle.file.sync_data()?;
+                    file.sync_data()?;
                 }
             }
 
@@ -1118,7 +1131,7 @@ async fn main() -> Result<(), Error> {
     // Step 3: split into download stage and decode/write stage with bounded backpressure
     let (tx, rx) = flume::bounded(decode_queue_capacity);
     let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
-    let file_handles = Arc::new(init_file_handles(&file_targets)?);
+    let file_handles = Arc::new(init_file_handles(&file_targets));
 
     let work_result = tokio::try_join!(
         download_chunks(
