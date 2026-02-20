@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -868,7 +868,7 @@ async fn download_chunks(
     client: &Client,
     retry_num: u32,
     cdn_health: Arc<CdnHealth>,
-    pb: &ProgressBar,
+    downloaded_bytes: Arc<AtomicU64>,
     tx: Sender<DownloadedChunk>,
 ) -> Result<(), Error> {
     stream::iter(all_chunks.into_iter().map(Ok::<ChunkInfo, Error>))
@@ -876,6 +876,7 @@ async fn download_chunks(
             let cdn_url_list_for_task = Arc::clone(&cdn_url_list);
             let cdn_url_suffix_list_for_task = Arc::clone(&cdn_url_suffix_list);
             let cdn_health_for_task = Arc::clone(&cdn_health);
+            let downloaded_bytes_for_task = Arc::clone(&downloaded_bytes);
             let tx_for_task = tx.clone();
             async move {
                 let data = chunk_info
@@ -887,7 +888,7 @@ async fn download_chunks(
                         cdn_health_for_task.as_ref(),
                     )
                     .await?;
-                pb.inc(data.len() as u64);
+                downloaded_bytes_for_task.fetch_add(data.len() as u64, Ordering::Relaxed);
                 tx_for_task
                     .send_async(DownloadedChunk { chunk_info, data })
                     .await
@@ -1066,13 +1067,31 @@ async fn main() -> Result<(), Error> {
     )?
     .progress_chars("#>-");
     let pb = ProgressBar::new(estimated_download_bytes).with_style(progress_style);
+    let downloaded_bytes = Arc::new(AtomicU64::new(0));
+    let progress_stop = Arc::new(AtomicBool::new(false));
+    let progress_task = {
+        let pb_for_task = pb.clone();
+        let downloaded_bytes_for_task = Arc::clone(&downloaded_bytes);
+        let progress_stop_for_task = Arc::clone(&progress_stop);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                pb_for_task.set_position(downloaded_bytes_for_task.load(Ordering::Relaxed));
+                if progress_stop_for_task.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        })
+    };
 
     // Step 3: split into download stage and decode/write stage with bounded backpressure
     let (tx, rx) = flume::bounded(decode_queue_capacity);
     let cdn_health = Arc::new(CdnHealth::new(cdn_url_list.len()));
     let file_handles = Arc::new(init_file_handles(&file_targets)?);
 
-    tokio::try_join!(
+    let work_result = tokio::try_join!(
         download_chunks(
             all_chunks,
             download_concurrency,
@@ -1081,11 +1100,17 @@ async fn main() -> Result<(), Error> {
             &client,
             config.retry_num,
             Arc::clone(&cdn_health),
-            &pb,
+            Arc::clone(&downloaded_bytes),
             tx,
         ),
         decode_and_write_chunks(rx, decode_concurrency, decoded_depot_key, file_handles),
-    )?;
+    );
+
+    progress_stop.store(true, Ordering::Relaxed);
+    progress_task.await?;
+    pb.set_position(downloaded_bytes.load(Ordering::Relaxed).min(estimated_download_bytes));
+    pb.finish();
+    work_result?;
 
     Ok(())
 }
