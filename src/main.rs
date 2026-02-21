@@ -1145,6 +1145,10 @@ async fn main() -> Result<(), Error> {
         }
     }
 
+    if all_chunks.is_empty() {
+        return Ok(());
+    }
+
     let progress_style = ProgressStyle::with_template(
         "[{elapsed_precise}] [{bar}] {decimal_bytes}/{decimal_total_bytes} ({decimal_bytes_per_sec}, {eta})",
     )?
@@ -1164,10 +1168,24 @@ async fn main() -> Result<(), Error> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut progress_started = false;
             loop {
                 ticker.tick().await;
-                pb_for_task.set_position(downloaded_bytes_for_task.load(Ordering::Relaxed));
-                if progress_stop_for_task.load(Ordering::Relaxed) {
+                let downloaded = downloaded_bytes_for_task.load(Ordering::Relaxed);
+                let should_stop = progress_stop_for_task.load(Ordering::Relaxed);
+
+                if downloaded > 0 {
+                    if !progress_started {
+                        pb_for_task.reset_elapsed();
+                        progress_started = true;
+                    }
+                    pb_for_task.set_position(downloaded);
+                }
+
+                if should_stop {
+                    if progress_started {
+                        pb_for_task.set_position(downloaded);
+                    }
                     break;
                 }
             }
