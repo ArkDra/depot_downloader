@@ -1,6 +1,6 @@
 [package]
 name = "depot_downloader"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["ArkDra", "arkdra@qq.com"]
 license = "MIT OR Apache-2.0"
@@ -17,6 +17,7 @@ futures = "0.3.32"
 indicatif = { version = "0.18.4" }
 lzma-rust2 = { version = "0.16.2", default-features = false, features = ["std", "optimization"] }
 num_cpus = "1.17.0"
+parking_lot = "0.12.5"
 protobuf = "3.7.2"
 reqwest = { version = "0.13.2", default-features = false, features = [
     "native-tls",
