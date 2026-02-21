@@ -712,16 +712,16 @@ fn prepare_output_file(
                 return Ok((true, path));
             }
         }
-    } else {
-        if let Some(parent_dir) = path.parent()
-            && !parent_dir.exists()
-        {
-            fs::create_dir_all(parent_dir)?;
-        }
-        File::create(&path)?;
+    } else if let Some(parent_dir) = path.parent()
+        && !parent_dir.exists()
+    {
+        fs::create_dir_all(parent_dir)?;
     }
-    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-    file.set_len(0)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
     file.set_len(file_size)?;
     Ok((false, path))
 }
