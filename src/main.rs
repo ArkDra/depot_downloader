@@ -12,6 +12,7 @@ use flume::{Receiver, Sender};
 use futures::stream::{self, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use lzma_rust2::LzmaReader;
+use parking_lot::Mutex;
 use protobuf::Message;
 use reqwest::{Client, Proxy};
 use serde_json::Value;
@@ -178,8 +179,14 @@ struct DownloadedChunk {
     data: Vec<u8>,
 }
 
+enum FileSlot {
+    Pending,
+    Open(Arc<File>),
+    Closed,
+}
+
 struct FileHandleState {
-    file: OnceLock<std::io::Result<File>>,
+    file: Mutex<FileSlot>,
     path: PathBuf,
     remaining_chunks: AtomicUsize,
 }
@@ -838,7 +845,7 @@ fn init_file_handles(
 
     for (path, chunk_count) in file_targets {
         file_handles.push(Arc::new(FileHandleState {
-            file: OnceLock::new(),
+            file: Mutex::new(FileSlot::Pending),
             path: path.clone(),
             remaining_chunks: AtomicUsize::new(*chunk_count),
         }));
@@ -847,20 +854,37 @@ fn init_file_handles(
     file_handles
 }
 
-fn get_or_open_file(file_handle: &FileHandleState) -> Result<&File, Error> {
-    let file_result = file_handle.file.get_or_init(|| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_handle.path)
-    });
-    match file_result {
-        Ok(file) => Ok(file),
-        Err(err) => Err(Error::Message(format!(
-            "Failed to open file {}: {err}",
-            file_handle.path.display()
-        ))),
+fn get_or_open_file(file_handle: &FileHandleState) -> Result<Arc<File>, Error> {
+    let mut slot = file_handle.file.lock();
+
+    if let FileSlot::Open(file) = &*slot {
+        return Ok(Arc::clone(file));
     }
+
+    if matches!(&*slot, FileSlot::Closed) {
+        return Err(Error::Message(format!(
+            "File already closed or failed to open: {}",
+            file_handle.path.display()
+        )));
+    }
+
+    let opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_handle.path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            *slot = FileSlot::Closed;
+            return Err(Error::Message(format!(
+                "Failed to open {}: {err}",
+                file_handle.path.display()
+            )));
+        }
+    };
+    let file = Arc::new(opened);
+    *slot = FileSlot::Open(Arc::clone(&file));
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -982,7 +1006,7 @@ async fn decode_and_write_chunks(
                         Error::Message(format!("Missing file handle for file_id {}", chunk_info.file_id))
                     })?;
                 let file = get_or_open_file(file_handle)?;
-                write_chunk_at(file, chunk_info.offset, &output_buffer)?;
+                write_chunk_at(file.as_ref(), chunk_info.offset, &output_buffer)?;
                 let prev = file_handle
                     .remaining_chunks
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -996,6 +1020,7 @@ async fn decode_and_write_chunks(
                     })?;
                 if prev == 1 {
                     file.sync_data()?;
+                    *file_handle.file.lock() = FileSlot::Closed;
                 }
             }
 
