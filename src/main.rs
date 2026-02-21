@@ -460,7 +460,7 @@ impl ChunkInfo {
                 Ok(body_data) => {
                     if !body_data.is_empty() {
                         cdn_health.mark_success(index, body_data.len(), elapsed_ms);
-                        return Ok(body_data.to_vec());
+                        return Ok(body_data.into());
                     }
                     if last_error.is_none() {
                         last_error = Some(format!("empty response body from {url}"));
