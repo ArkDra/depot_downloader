@@ -171,7 +171,7 @@ struct ChunkInfo {
     original_size: u32,
     depot_id: u32,
     file_id: usize,
-    content_sha: String,
+    content_sha: [u8; 20],
 }
 
 struct DownloadedChunk {
@@ -397,7 +397,7 @@ impl ChunkInfo {
         original_size: u32,
         depot_id: u32,
         file_id: usize,
-        content_sha: String,
+        content_sha: [u8; 20],
     ) -> Self {
         ChunkInfo {
             offset,
@@ -406,6 +406,10 @@ impl ChunkInfo {
             file_id,
             content_sha,
         }
+    }
+
+    fn sha_hex(&self) -> String {
+        HEXLOWER.encode(&self.content_sha)
     }
 
     pub async fn get_chunk(
@@ -430,6 +434,7 @@ impl ChunkInfo {
         let mut backoff_ms = INITIAL_BACKOFF_MS;
         let mut last_error: Option<String> = None;
         let mut last_index: Option<usize> = None;
+        let chunk_sha_hex = self.sha_hex();
 
         loop {
             let selection_seed = NEXT_URL_INDEX
@@ -439,7 +444,7 @@ impl ChunkInfo {
             let index = cdn_health.pick_best_index(selection_seed, avoid_index);
             let url = format!(
                 "http://{}/depot/{}/chunk/{}{}",
-                &cdn_url_list[index], self.depot_id, self.content_sha, &cdn_url_suffix_list[index]
+                &cdn_url_list[index], self.depot_id, chunk_sha_hex, &cdn_url_suffix_list[index]
             );
             let started_at = Instant::now();
             cdn_health.on_request_start(index);
@@ -483,7 +488,7 @@ impl ChunkInfo {
             } else {
                 return Err(Error::Message(format!(
                     "Failed to download chunk {} after {} attempts: {}",
-                    self.content_sha,
+                    chunk_sha_hex,
                     max_attempts,
                     last_error.unwrap_or_else(|| "unknown error".to_string())
                 )));
@@ -1115,12 +1120,20 @@ async fn main() -> Result<(), Error> {
                 if chunk.cb_compressed != 0 {
                     estimated_download_bytes += chunk.cb_compressed as u64;
                 }
+                let chunk_sha: [u8; 20] = chunk.sha.as_slice().try_into().map_err(|_| {
+                    Error::Message(format!(
+                        "Invalid chunk SHA length for {} at offset {}: expected 20 bytes, got {}",
+                        file_name,
+                        chunk.offset,
+                        chunk.sha.len()
+                    ))
+                })?;
                 let chunk_info = ChunkInfo::new(
                     chunk.offset,
                     chunk.cb_original,
                     metadata.depot_id,
                     file_id,
-                    HEXLOWER.encode(&chunk.sha),
+                    chunk_sha,
                 );
                 file_chunks.push(chunk_info);
             }
