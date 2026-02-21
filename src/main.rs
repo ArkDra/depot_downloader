@@ -74,6 +74,7 @@ const MAX_BACKOFF_MS: u64 = 2_000;
 const EWMA_ALPHA_PERMILLE: u32 = 200;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_BASE_COOLDOWN_MS: u64 = 1_500;
+const FILE_VERIFY_BUFFER_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Parser)]
 struct Args {
@@ -681,6 +682,7 @@ fn prepare_output_file(
     depot_id: u32,
     output_path: &str,
     file_size: u64,
+    verify_buffer: &mut [u8],
 ) -> Result<(bool, PathBuf), Error> {
     let path = if output_path == "default" {
         let mut path_buf = std::env::current_dir()?;
@@ -696,14 +698,13 @@ fn prepare_output_file(
         if metadata.len() == file_size {
             let mut file = File::open(&path)?;
             let mut hasher = Sha1::default();
-            let mut buffer = vec![0u8; 10485760];
 
             loop {
-                let bytes_read = file.read(&mut buffer)?;
+                let bytes_read = file.read(verify_buffer)?;
                 if bytes_read == 0 {
                     break;
                 }
-                hasher.update(&buffer[..bytes_read]);
+                hasher.update(&verify_buffer[..bytes_read]);
             }
 
             let downloaded_file_sha = HEXLOWER.encode(&hasher.finalize());
@@ -1083,6 +1084,7 @@ async fn main() -> Result<(), Error> {
     let mut all_chunks = Vec::new();
     let mut file_targets = Vec::new();
     let mut estimated_download_bytes = 0;
+    let mut verify_buffer = vec![0u8; FILE_VERIFY_BUFFER_BYTES];
     // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
         if file.flags == 0 {
@@ -1108,6 +1110,7 @@ async fn main() -> Result<(), Error> {
                 metadata.depot_id,
                 config.output_path,
                 file.size,
+                &mut verify_buffer,
             )?;
             if is_exist {
                 continue;
