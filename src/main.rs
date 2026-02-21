@@ -433,7 +433,6 @@ impl ChunkInfo {
         let max_attempts = retry_num.saturating_add(1);
         let mut attempts_made = 0;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
-        let mut last_error: Option<String> = None;
         let mut last_index: Option<usize> = None;
         let chunk_sha_hex = self.sha_hex();
 
@@ -462,24 +461,20 @@ impl ChunkInfo {
             };
 
             let elapsed_ms = started_at.elapsed().as_millis().max(1) as u64;
-            match request_result {
+            let err_message = match request_result {
                 Ok(body_data) => {
                     if !body_data.is_empty() {
                         cdn_health.mark_success(index, body_data.len(), elapsed_ms);
                         return Ok(body_data.into());
                     }
-                    if last_error.is_none() {
-                        last_error = Some(format!("empty response body from {url}"));
-                    }
                     cdn_health.mark_failure(index);
+                    format!("empty response body from {url}")
                 }
                 Err(err_message) => {
-                    if last_error.is_none() {
-                        last_error = Some(err_message);
-                    }
                     cdn_health.mark_failure(index);
+                    err_message
                 }
-            }
+            };
 
             last_index = Some(index);
             attempts_made += 1;
@@ -491,7 +486,7 @@ impl ChunkInfo {
                     "Failed to download chunk {} after {} attempts: {}",
                     chunk_sha_hex,
                     max_attempts,
-                    last_error.unwrap_or_else(|| "unknown error".to_string())
+                    err_message
                 )));
             }
         }
