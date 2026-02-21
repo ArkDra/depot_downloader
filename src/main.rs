@@ -608,20 +608,25 @@ impl<'a> Decrypt<'a> {
 }
 
 fn set_client(proxy_url: Option<&str>) -> Result<Client, Error> {
+    let mut builder = reqwest::ClientBuilder::new()
+        .use_native_tls()
+        .tcp_keepalive(Duration::from_secs(20))
+        .tcp_nodelay(true)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(60));
+
     match proxy_url {
-        Some(proxy_url) => Ok(reqwest::ClientBuilder::new()
-            .use_native_tls()
-            .tcp_keepalive(Duration::from_secs(20))
-            .timeout(Duration::from_secs(30))
-            .proxy(Proxy::all(proxy_url)?)
-            .build()?),
-        None => Ok(reqwest::ClientBuilder::new()
-            .use_native_tls()
-            .tcp_keepalive(Duration::from_secs(20))
-            .timeout(Duration::from_secs(30))
-            .no_proxy()
-            .build()?),
+        Some(proxy_url) => {
+            builder = builder.proxy(Proxy::all(proxy_url)?);
+        }
+        None => {
+            builder = builder.no_proxy();
+        }
     }
+
+    Ok(builder.build()?)
 }
 
 async fn get_cdn_url_list(client: &Client) -> Result<Vec<String>, Error> {
