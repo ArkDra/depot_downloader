@@ -125,15 +125,10 @@ impl Args {
                         cdn_url
                             .iter()
                             .cloned()
-                            .zip(
-                                cdn_url_suffix
-                                    .iter()
-                                    .cloned()
-                                    .chain(std::iter::repeat_n(
-                                        "".to_string(),
-                                        cdn_url.len() - cdn_url_suffix.len(),
-                                    )),
-                            )
+                            .zip(cdn_url_suffix.iter().cloned().chain(std::iter::repeat_n(
+                                "".to_string(),
+                                cdn_url.len() - cdn_url_suffix.len(),
+                            )))
                             .collect(),
                     )
                 } else {
@@ -256,7 +251,7 @@ impl CdnHealth {
         if let Some(node) = self.nodes.get(index) {
             let _ = node
                 .inflight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     Some(value.saturating_sub(1))
                 });
 
@@ -264,7 +259,7 @@ impl CdnHealth {
             node.ewma_fail_rate_permille
                 .store(ewma_update_u32(old_fail_rate, 1_000), Ordering::Relaxed);
 
-            let failure_streak = match node.consecutive_failures.fetch_update(
+            let failure_streak = match node.consecutive_failures.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |value| Some(value.saturating_add(1)),
@@ -279,7 +274,7 @@ impl CdnHealth {
                     .unwrap_or(u64::MAX)
                     .min(CIRCUIT_BREAKER_BASE_COOLDOWN_MS.saturating_mul(10));
                 let open_until = monotonic_now_ms().saturating_add(cooldown_ms);
-                let _ = node.cooldown_until_ms.fetch_update(
+                let _ = node.cooldown_until_ms.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |existing| Some(existing.max(open_until)),
@@ -292,7 +287,7 @@ impl CdnHealth {
         if let Some(node) = self.nodes.get(index) {
             let _ = node
                 .inflight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     Some(value.saturating_sub(1))
                 });
 
@@ -487,9 +482,7 @@ impl ChunkInfo {
             } else {
                 return Err(Error::Message(format!(
                     "Failed to download chunk {} after {} attempts: {}",
-                    chunk_sha_hex,
-                    max_attempts,
-                    err_message
+                    chunk_sha_hex, max_attempts, err_message
                 )));
             }
         }
@@ -765,19 +758,12 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
         }
 
         let props = compressed_data[7];
-        let dict_size = u32::from_le_bytes(
-            compressed_data[8..12]
-                .try_into()
-                .map_err(|_| Error::Message("Compressed LZMA chunk has invalid dict size".to_string()))?,
-        );
-        let mut reader = LzmaReader::new_with_props(
-            raw_data,
-            decrypted_size as u64,
-            props,
-            dict_size,
-            None,
-        )
-        .map_err(|e| Error::Message(format!("LZMA decoder init error: {e}")))?;
+        let dict_size = u32::from_le_bytes(compressed_data[8..12].try_into().map_err(|_| {
+            Error::Message("Compressed LZMA chunk has invalid dict size".to_string())
+        })?);
+        let mut reader =
+            LzmaReader::new_with_props(raw_data, decrypted_size as u64, props, dict_size, None)
+                .map_err(|e| Error::Message(format!("LZMA decoder init error: {e}")))?;
         output.resize(decrypted_size, 0);
         reader
             .read_exact(output.as_mut_slice())
@@ -847,9 +833,7 @@ fn decompress_into(compressed_data: &[u8], output: &mut Vec<u8>) -> Result<(), E
     }
 }
 
-fn init_file_handles(
-    file_targets: &[(PathBuf, usize)],
-) -> Vec<Arc<FileHandleState>> {
+fn init_file_handles(file_targets: &[(PathBuf, usize)]) -> Vec<Arc<FileHandleState>> {
     let mut file_handles = Vec::with_capacity(file_targets.len());
 
     for (path, chunk_count) in file_targets {
@@ -1009,16 +993,20 @@ async fn decode_and_write_chunks(
                     )));
                 }
 
-                let file_handle = file_handles_for_worker
-                    .get(chunk_info.file_id)
-                    .ok_or_else(|| {
-                        Error::Message(format!("Missing file handle for file_id {}", chunk_info.file_id))
-                    })?;
+                let file_handle =
+                    file_handles_for_worker
+                        .get(chunk_info.file_id)
+                        .ok_or_else(|| {
+                            Error::Message(format!(
+                                "Missing file handle for file_id {}",
+                                chunk_info.file_id
+                            ))
+                        })?;
                 let file = get_or_open_file(file_handle)?;
                 write_chunk_at(file.as_ref(), chunk_info.offset, &output_buffer)?;
                 let prev = file_handle
                     .remaining_chunks
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_sub(1)
                     })
                     .map_err(|_| {
@@ -1212,7 +1200,11 @@ async fn main() -> Result<(), Error> {
 
     progress_stop.store(true, Ordering::Relaxed);
     progress_task.await?;
-    pb.set_position(downloaded_bytes.load(Ordering::Relaxed).min(estimated_download_bytes));
+    pb.set_position(
+        downloaded_bytes
+            .load(Ordering::Relaxed)
+            .min(estimated_download_bytes),
+    );
     match work_result {
         Ok(_) => pb.finish(),
         Err(err) => {
