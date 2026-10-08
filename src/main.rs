@@ -75,6 +75,9 @@ const EWMA_ALPHA_PERMILLE: u32 = 200;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_BASE_COOLDOWN_MS: u64 = 1_500;
 const FILE_VERIFY_BUFFER_BYTES: usize = 10 * 1024 * 1024;
+// Steam EDepotFileFlag bits that identify non-regular file entries.
+const FILE_FLAG_DIRECTORY: u32 = 1 << 6;
+const FILE_FLAG_SYMLINK: u32 = 1 << 9;
 
 #[derive(Parser)]
 struct Args {
@@ -1082,7 +1085,7 @@ async fn main() -> Result<(), Error> {
     let mut verify_buffer = vec![0u8; FILE_VERIFY_BUFFER_BYTES];
     // Step 1: Preprocess all files to be downloaded
     for file in payload.mappings {
-        if file.flags == 0 {
+        if file.flags & (FILE_FLAG_DIRECTORY | FILE_FLAG_SYMLINK) == 0 {
             let file_name = if metadata.filenames_encrypted {
                 let decoded_file_name = BASE64_MIME.decode(file.filename.as_bytes())?;
                 let mut decrypt = Decrypt::new(decoded_file_name, decoded_depot_key.as_ref());
